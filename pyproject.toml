@@ -44,6 +44,13 @@ dependencies = [
     "clip @ file:///${PROJECT_ROOT}/third_party/CLIP",
 ]
 
+[project.optional-dependencies]
+# `python inference.py --wandb`. Optional because the pipeline is fully usable
+# without it: utils/wandb_utils.py imports wandb lazily and no-ops if it is
+# missing. Install with `uv sync --extra logging`.
+# Floor of 0.19: Settings became a pydantic model there.
+logging = ["wandb>=0.19"]
+
 [project.urls]
 Homepage = "https://people.engr.tamu.edu/nimak/Papers/RI3D/index.html"
 Repository = "https://github.com/avinashpaliwal/RI3D"

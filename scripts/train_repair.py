@@ -7,6 +7,8 @@ sys.path.insert(0, ri3d_root)
 sys.path.insert(0, os.path.join(ri3d_root, "third_party", "minLoRA"))
 sys.path.insert(0, os.path.join(ri3d_root, "third_party", "CLIP"))
 
+from utils import wandb_utils as wb
+
 
 class ColoredFilter(logging.Filter):
     """
@@ -65,8 +67,23 @@ def main(args, extras) -> None:
     import pytorch_lightning as pl
     from pytorch_lightning import Trainer
     from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-    from pytorch_lightning.loggers import CSVLogger
+    from pytorch_lightning.loggers import CSVLogger, WandbLogger
     from lightning_utilities.core.rank_zero import rank_zero_only
+
+    class _StageWandbLogger(WandbLogger):
+        """Namespace every metric under stage_<x>/ on the stage's own x-axis.
+
+        Two things the stock logger gets wrong for a shared run: `_add_prefix`
+        joins with "-" (giving `stage_5a-train/loss`), and its own
+        `trainer/global_step` key is never prefixed, so 5a and 5b would end up
+        sharing one axis.
+        """
+
+        def log_metrics(self, metrics, step=None):
+            out = {f"{self._prefix}/{k}": v for k, v in metrics.items()}
+            if step is not None:
+                out[f"{self._prefix}/step"] = step
+            self.experiment.log(out)
 
     if args.typecheck:
         from jaxtyping import install_import_hook
@@ -140,6 +157,16 @@ def main(args, extras) -> None:
         loggers += [
             CSVLogger(cfg.trial_dir, name="csv_logs"),
         ]
+        # The system already self.log()s every scalar we want, so this is pure
+        # wiring. Handing WandbLogger an already-open run matters: when it
+        # creates one itself it installs define_metric("*",
+        # step_metric="trainer/global_step"), a run-wide default x-axis that
+        # would silently re-axis metrics logged by the other stages.
+        run = wb.attach()
+        if run is not None:
+            prefix = f"stage_{wb.stage(default='5a')}"
+            wb.define_axis(prefix, "step")
+            loggers += [_StageWandbLogger(experiment=run, prefix=prefix)]
         rank_zero_only(
             lambda: write_to_text(
                 os.path.join(cfg.trial_dir, "cmd.txt"),
@@ -157,6 +184,7 @@ def main(args, extras) -> None:
     )
 
     trainer.fit(system, datamodule=dm, ckpt_path=cfg.resume)
+    wb.finish()
 
 
 if __name__ == "__main__":

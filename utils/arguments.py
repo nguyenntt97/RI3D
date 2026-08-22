@@ -54,6 +54,17 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        # Belongs here rather than on the individual training scripts: Scene hands
+        # loadCam the *extracted* ModelParams group, and extract() only copies
+        # attributes declared in this class. A flag added to a script's own parser
+        # silently never arrives.
+        #
+        # Weight for pixels under the watermark mask. 0 ignores them entirely --
+        # the only safe value while the photographs still carry the watermark.
+        # After stage `wmi` has inpainted them, a small positive value lets that
+        # region constrain the Gaussians without invented content outweighing real
+        # photographs.
+        self.wm_loss_weight = 0.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -94,6 +105,38 @@ class OptimizationParams(ParamGroup):
         self.sample_pseudo_interval = 10 # not use
         self.random_background = False
         super().__init__(parser, "Optimization Parameters")
+
+LOO_DENSIFY_FRACTION = 0.6
+
+
+def apply_loo_iterations(args, loo_iterations):
+    """Rescale everything a leave-one-out run couples to its iteration count.
+
+    Shortening a leave-one-out run by passing `--iterations` alone does not work,
+    and fails silently. Four values move together and only one of them follows:
+
+      - `densify_until_iter` is derived in OptimizationParams.__init__ as
+        0.6 * iterations, i.e. from the *default* 10_000. It stays 6000 however
+        `--iterations` is set. Sample capture in leave_one_out_stage1.py is gated
+        on `iteration > densify_until_iter`, so a short run writes no
+        `left_image/` samples at all -- the entire product of the stage.
+      - `checkpoint_iterations` defaults to [6000], the checkpoint stage 2b
+        resumes from.
+      - stage 2b's resume filename is built from the same number.
+      - `position_lr_max_steps` is 30_000, so a short run never gets far enough
+        down the xyz schedule for the model to settle.
+
+    Call this on the argparse namespace *before* OptimizationParams.extract, which
+    copies these attributes across. Returns the densify/capture boundary, which is
+    also the checkpoint iteration.
+    """
+    args.iterations = loo_iterations
+    boundary = int(LOO_DENSIFY_FRACTION * loo_iterations)
+    args.densify_until_iter = boundary
+    args.checkpoint_iterations = [boundary]
+    args.position_lr_max_steps = loo_iterations
+    return boundary
+
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]

@@ -27,12 +27,15 @@ from scene import GaussianModel, Scene
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim, monodisp, l2_loss, masked_l1_loss, masked_ssim
+from utils import wandb_utils as wb
 # from torch.utils.tensorboard.writer import SummaryWriter
 # TENSORBOARD_FOUND = True
 
 def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    wb.attach()
+    wb.define_axis("stage_1b", "iter")
     gaussians = GaussianModel(dataset.sh_degree, args.sparse_view_num, spherical_gaussians=True)
     scene = Scene(dataset, gaussians, extra_opts=args)
     gaussians.load_ply(args.ply_path)
@@ -105,7 +108,7 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
             render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
-        loss, Ll1 = cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, tb_writer=tb_writer, iteration=iteration)
+        loss, Ll1, terms = cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, tb_writer=tb_writer, iteration=iteration)
 
         
         # # # sparse_dep_loss = MSE_Loss(ren_depth * gaussians.sparse_dep_mask[cam_id], gaussians.sparse_dep_mask[cam_id] * gaussians.sparse_dep[cam_id])
@@ -139,8 +142,17 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            elapsed_ms = iter_start.elapsed_time(iter_end)
+            if wb.due(iteration, opt.iterations):
+                wb.log({"stage_1b/iter": iteration,
+                        "stage_1b/loss": loss,
+                        "stage_1b/ema_loss": ema_loss_for_log,
+                        "stage_1b/num_gauss": num_gauss,
+                        "stage_1b/iter_ms": elapsed_ms,
+                        **{f"stage_1b/{k}": v for k, v in terms.items()}})
+
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -208,9 +220,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
+        evals = {}
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
@@ -227,9 +240,15 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                evals[f"stage_1b/eval_{config['name']}_l1"] = l1_test
+                evals[f"stage_1b/eval_{config['name']}_psnr"] = psnr_test
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+        # One row carrying every config's numbers, so they share an x value.
+        if evals:
+            wb.log({"stage_1b/iter": iteration, **evals})
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
@@ -252,6 +271,12 @@ def cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, silhouette_loss_ty
     Ll1 = masked_l1_loss(image, gt_image, loss_mask)
     Lssim = (1.0 - masked_ssim(image, gt_image, loss_mask))
     loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim
+    # Scalar components for the metric logger. mask_weight makes a zero L1
+    # attributable: masked_l1_loss returns a hard zero when the mask's total
+    # weight drops below 1, which otherwise reads as perfect convergence.
+    terms = {"l1": Ll1, "ssim_loss": Lssim}
+    if loss_mask is not None:
+        terms["mask_weight"] = loss_mask.mean()
     if tb_writer is not None:
         tb_writer.add_scalar('loss/l1_loss', Ll1, iteration)
         tb_writer.add_scalar('loss/ssim_loss', Lssim, iteration)
@@ -276,10 +301,11 @@ def cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, silhouette_loss_ty
     # depth_loss = l2_loss(viewpoint_cam.mono_depth, render_pkg["rendered_depth"])
 
         loss = loss + args.mono_depth_weight * depth_loss
+        terms["depth_loss"] = depth_loss
         if tb_writer is not None:
             tb_writer.add_scalar('loss/depth_loss', depth_loss, iteration)
 
-    return loss, Ll1
+    return loss, Ll1, terms
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -328,6 +354,8 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(args, lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, 
              args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+
+    wb.finish()
 
     # All done
     print("\nTraining complete.")

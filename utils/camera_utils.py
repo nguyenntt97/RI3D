@@ -84,15 +84,25 @@ def loadCam(args,
     # else:
     loaded_mask = None
 
-    # Photometric-loss mask, resized to the training resolution. Nearest, and the
-    # threshold biases toward *ignoring*: a pixel only counts as supervised if it
-    # is fully outside the mask, so resampling never reintroduces watermark pixels.
+    # Photometric-loss weight, resized to the training resolution. Nearest, and the
+    # threshold biases toward *distrusting*: a pixel only counts as fully
+    # supervised if it is fully outside the mask, so resampling never smuggles
+    # masked pixels back in at full weight.
+    #
+    # `wm_loss_weight` sets what the masked region is worth. 0 (the default)
+    # reproduces the original behaviour of ignoring it entirely, which is the only
+    # safe value while the photographs still contain the watermark. Once stage
+    # `wmi` has replaced it with inpainted content, a small positive weight lets
+    # that region constrain the Gaussians -- it is plausible rather than
+    # photographic, so it should pull less hard than real evidence.
     loss_mask = None
     if cam_info.loss_mask is not None:
         lm = cv2.resize(
             cam_info.loss_mask.astype(np.float32), resolution, interpolation=cv2.INTER_AREA
         )
-        loss_mask = torch.from_numpy((lm >= 0.999).astype(np.float32)).unsqueeze(0)
+        clean = (lm >= 0.999).astype(np.float32)
+        w = float(getattr(args, "wm_loss_weight", 0.0))
+        loss_mask = torch.from_numpy(clean + (1.0 - clean) * w).unsqueeze(0)
 
     mono_depth = cam_info.mono_depth
     ### we load depth here for acceleration

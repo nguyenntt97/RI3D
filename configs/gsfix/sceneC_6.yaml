@@ -1,0 +1,130 @@
+# Per-scene GSFixer fine-tuning config for RI3D stage 1c.
+#
+# Derived from GSFix3D's config/finetune_gsfixer.yaml, flattened into one file
+# (its three replica_{train,val,vis}.yaml splits all point at the same directory,
+# so keeping them separate bought nothing here).
+#
+# `sceneC_6/finetune` is substituted per scene by the stage-1c driver; it is a
+# path relative to --base_data_dir, e.g. "sceneC_6/finetune".
+#
+# The `base_config` entries below resolve against the *current working
+# directory*, not against this file (src/util/config_util.py:36 calls
+# OmegaConf.load on them verbatim). The driver therefore runs GSFix3D's
+# train.py with cwd=<gsfix_root> while passing an absolute --config path here,
+# which keeps this file in the RI3D tree and leaves GSFix3D untouched.
+base_config:
+- config/logging.yaml
+- config/wandb.yaml
+- config/model_gsfixer.yaml
+
+# Overrides config/wandb.yaml's `project: gsfixer`; train.py splats `**cfg.wandb`
+# last, so this also beats its hard-coded name/mode. Placeholders are substituted
+# by the stage-1c driver alongside sceneC_6/finetune.
+#
+# This is deliberately a SEPARATE run from RI3D's pipeline run, sharing only the
+# project and group: train.py inits with sync_tensorboard=True, which takes over
+# the step axis and restarts it at 0. Joining the pipeline run would clobber a
+# history already thousands of rows deep.
+wandb:
+  project: ri3d
+  group: sceneC_6
+  job_type: gsfixer-finetune
+
+model:
+  # Overrides model_gsfixer.yaml's `gsfixer-full`. RI3D has no mesh, so we need
+  # the single-condition variant: gsfixer-base's UNet takes 8 latent channels
+  # (4 noise + 4 render), gsfixer-full takes 12. This MUST stay consistent with
+  # dual_input below or the UNet gets the wrong channel count.
+  pretrained_path: gsfixer-base
+
+dataset:
+  # `name: replica` is a class selector, not a dataset identity -- it maps to
+  # BaseFinetuneDataset in src/dataset/__init__.py:45, which just reads
+  # <dir>/rgb and <dir>/rendered_gs. Nothing Replica-specific is involved.
+  train:
+    name: replica
+    disp_name: ri3d_train
+    dir: sceneC_6/finetune
+    dual_input: false
+    resize_to_hw:
+    - 576
+    - 768
+  val:
+    name: replica
+    disp_name: ri3d_val
+    dir: sceneC_6/finetune
+    dual_input: false
+    resize_to_hw:
+    - 576
+    - 768
+  vis:
+    name: replica
+    disp_name: ri3d_vis
+    dir: sceneC_6/finetune
+    dual_input: false
+    resize_to_hw:
+    - 576
+    - 768
+
+pipeline:
+  name: MarigoldGSFixerPipeline
+  kwargs:
+    default_denoising_steps: 4
+    default_processing_resolution: 768
+
+dataloader:
+  num_workers: 2
+  effective_batch_size: 32
+  max_train_batch_size: 2
+  seed: 2025
+
+trainer:
+  name: MarigoldGSFixerFinetune
+  init_seed: 2025
+  save_period: 400
+  backup_period: 1000
+  validation_period: 400
+  visualization_period: 100
+
+multi_res_noise:
+  strength: 0.9
+  annealed: true
+  downscale_strategy: original
+
+max_epoch: 10000
+max_iter: 800
+
+optimizer:
+  name: Adam
+
+loss:
+  name: mse_loss
+  kwargs:
+    reduction: mean
+
+lr: 3.0e-05
+lr_scheduler:
+  name: IterExponential
+  kwargs:
+    total_iter: 25000
+    final_ratio: 0.01
+    warmup_steps: 100
+
+validation:
+  denoising_steps: 1
+  ensemble_size: 1
+  processing_res: 0
+  match_input_res: false
+  resample_method: bilinear
+  main_val_metric: lpips
+  main_val_metric_goal: minimize
+  init_seed: 2025
+
+eval:
+  alignment: least_square
+  align_max_res: null
+  eval_metrics:
+  - mse
+  - psnr
+  - ssim
+  - lpips

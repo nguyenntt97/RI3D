@@ -39,6 +39,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from utils import wandb_utils as wb
+
 # Color styling for CLI output
 class Colors:
     HEADER = '\033[95m'
@@ -69,11 +71,17 @@ def log_error(msg):
     print(f"{Colors.FAIL}[✗] {msg}{Colors.ENDC}")
 
 
-def run_command(command, dry_run=False):
+# Wall-clock per stage, keyed by the label passed to run_command. Reported as
+# pipeline/seconds/<stage>, since wandb's own run duration measures the union of
+# the per-stage sessions rather than elapsed time.
+STAGE_SECONDS = {}
+
+
+def run_command(command, dry_run=False, stage=None, external=False):
     print(f"{Colors.BLUE}$ {command}{Colors.ENDC}")
     if dry_run:
         return True
-    
+
     # Ensure current project directory, mast3r, and third_party submodules are on PYTHONPATH
     env = os.environ.copy()
     ri3d_root = os.path.dirname(os.path.abspath(__file__))
@@ -82,14 +90,23 @@ def run_command(command, dry_run=False):
     clip_path = os.path.join(ri3d_root, "third_party", "CLIP")
     current_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{ri3d_root}:{mast3r_path}:{minlora_path}:{clip_path}:{current_pythonpath}"
-    
+    # `external=True` strips the run id so a foreign trainer that calls
+    # wandb.init() itself starts its own run instead of hijacking this one.
+    wb.child_env(env, stage_name=stage, external=external)
+
     import subprocess
+    started = time.perf_counter()
     proc = subprocess.run(command, shell=True, env=env)
+    if stage is not None:
+        STAGE_SECONDS[stage] = STAGE_SECONDS.get(stage, 0.0) + time.perf_counter() - started
     if proc.returncode != 0:
         log_error(f"Command failed with return code {proc.returncode}:")
         log_error(f"  {command}")
         sys.exit(proc.returncode)
     return True
+
+
+from utils.watermark_utils import CLEAN_DIRNAME, resolve_image_path
 
 
 def check_checkpoints(args):
@@ -106,6 +123,17 @@ def check_checkpoints(args):
         missing.append(("ControlNet Tile v1.1", controlnet_ckpt, "python scripts/download_hf_models.py"))
     if not sd2_inp_dir.exists():
         missing.append(("SD2 Inpainting Model", sd2_inp_dir, "python scripts/download_hf_models.py"))
+
+    # Stage 1c is opt-in, so this is keyed off the raw --stages string (the parsed
+    # stage set is not built until later). GSFix3D resolves the checkpoint as
+    # <base_ckpt_dir>/<pretrained_path> and only fails at from_pretrained, which
+    # is after the export, the leave-one-out pairs and the trainer's own startup
+    # -- an hour of compute before a missing directory is reported.
+    if "1c" in args.stages.lower():
+        gsfix_ckpt = Path(args.gsfix_ckpt)
+        if not (gsfix_ckpt / "model_index.json").exists():
+            missing.append(("GSFixer base checkpoint", gsfix_ckpt,
+                            "python scripts/download_hf_models.py"))
 
     if args.sfm_config == "unposed" and args.sfm_backend == "mast3r":
         mast3r_ckpt = Path("third_party/MASt3R/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth")
@@ -326,18 +354,18 @@ def run_sfm_and_extract_pointmap(source_path, output_scene_dir, args, dry_run=Fa
                 cmd += " --ggpt_refine"
             if args.watermark_mask:
                 cmd += f" --watermark_mask {args.watermark_mask}"
-        run_command(cmd, dry_run=dry_run)
+        run_command(cmd, dry_run=dry_run, stage="sfm", external=True)
     elif backend == "mast3r" and os.path.exists(g4splat_sfm):
         cmd = (f"cd /home/nguyen/projects/G4Splat && python scripts/run_sfm.py "
                f"--source_path {source_path} --output_path {sfm_out_dir} "
                f"--config {args.sfm_config} --n_images {args.num_views}")
-        run_command(cmd, dry_run=dry_run)
+        run_command(cmd, dry_run=dry_run, stage="sfm", external=True)
     else:
         log_warn("No run_sfm.py found; checking local tools...")
         sparse_pc_tool = "tools/sparse_pc.py"
         if os.path.exists(sparse_pc_tool):
             cmd = f"python {sparse_pc_tool} --source_path {source_path} --output_path {output_scene_dir}"
-            run_command(cmd, dry_run=dry_run)
+            run_command(cmd, dry_run=dry_run, stage="sfm")
 
     # Convert resulting COLMAP sparse model to transforms.json
     if not dry_run:
@@ -471,7 +499,10 @@ def generate_aligned_depth(scene_path, image_dir, num_views, depth_source="point
         )
 
         if depth_source == "align":
-            img = Image.open(img_path).convert("RGB")
+            # Depth-Anything runs on the photograph itself, so a burned-in overlay
+            # distorts the monocular disparity it returns. Use the inpainted copy
+            # when stage `wmi` has produced one.
+            img = Image.open(resolve_image_path(img_path)).convert("RGB")
             with torch.no_grad():
                 disparity = estimate_depth(ToTensor()(img).cuda()).cpu().numpy()
             if disparity.shape != (height, width):
@@ -613,6 +644,42 @@ def parse_args():
     parser.add_argument("--ggpt_refine", action="store_true",
                         help="Additionally run GGPT's PTv3 point transformer over the fused pointmap "
                              "(needs GGPT/ckpts/model.step228000.pth and the ptv3 extras).")
+    parser.add_argument("--loo_iterations", type=int, default=None,
+                        help="Iterations per leave-one-out model (stages 2a/2b). Default 10_000. "
+                             "This stage trains one full model per sparse view and is the longest "
+                             "in the pipeline -- ~62 min for sceneC's 6 views. Lowering it here "
+                             "also rescales the densify/capture boundary, the checkpoint iteration "
+                             "and the LR schedule, which --iterations alone does not.")
+    parser.add_argument("--force_loo", action="store_true",
+                        help="Delete an existing leave-one-out directory before stage 2a instead of "
+                             "refusing. Needed because 2a only writes gt.png when absent, so a "
+                             "re-run into a populated directory keeps the old targets.")
+    parser.add_argument("--wm_loss_weight", type=float, default=0.0,
+                        help="Photometric weight for pixels under the watermark mask in stages "
+                             "1b/2a/2b. 0 ignores them, which is the only safe value while the "
+                             "photographs still carry the watermark. Run stage 'wmi' to replace "
+                             "it with inpainted content, then a small value (0.1-0.3) lets that "
+                             "region constrain the Gaussians instead of being left unsupervised.")
+    parser.add_argument("--gsfix_root", type=str, default="/home/nguyen/projects/GSFix3D",
+                        help="Path to the GSFix3D checkout (stage 1c). Its trainer resolves "
+                             "base_config entries against the cwd, so it is invoked from there.")
+    parser.add_argument("--gsfix_ckpt", type=str, default="models/gsfixer-base",
+                        help="Base GSFixer checkpoint (stage 1c). Must be the single-condition "
+                             "'base' variant: RI3D has no mesh, and 'gsfixer-full' expects a "
+                             "12-channel latent instead of 8.")
+    parser.add_argument("--gsfix_finetune", action="store_true", default=True,
+                        help="Fine-tune GSFixer on this scene's leave-one-out pairs before "
+                             "repairing (stage 1c)")
+    parser.add_argument("--no_gsfix_finetune", dest="gsfix_finetune", action="store_false",
+                        help="Run GSFixer zero-shot from the base checkpoint instead")
+    parser.add_argument("--gsfix_pairs_window", type=int, default=240,
+                        help="Keep leave-one-out samples within this many iterations of the "
+                             "first (stage 1c). Past iteration 6000 the leave-one-out model "
+                             "trains on the held-out view too, so late samples converge on the "
+                             "ground truth and would teach GSFixer the identity map.")
+    parser.add_argument("--gsfix_anchor_every", type=int, default=1,
+                        help="During the stage-1c lift, take one sparse-photograph step every N "
+                             "repaired views. 0 reproduces GSFix3D's refine_gs.py exactly.")
     parser.add_argument("--watermark_mask", type=str, default=None,
                         help="PNG mask (255 = ignore) of burned-in watermarks. Supplying one skips "
                              "the 'wm' detection stage. Masked pixels are excluded from matching, "
@@ -644,6 +711,28 @@ def parse_args():
                         help="Render a smooth 360-degree novel-view trajectory video upon completion")
     parser.add_argument("--no_render_video", dest="render_video", action="store_false",
                         help="Skip novel-view video rendering")
+
+    # Logging
+    parser.add_argument("--wandb", action="store_true",
+                        help="Log per-stage scalar metrics (losses, gaussian counts, timings) "
+                             "to one Weights & Biases run. Every stage runs as its own "
+                             "subprocess and resumes the same run id, with metrics namespaced "
+                             "stage_<name>/ on their own x-axis. Images are never logged.")
+    parser.add_argument("--wandb_project", type=str, default="ri3d",
+                        help="wandb project (--wandb)")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="wandb entity/team; defaults to your personal one (--wandb)")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Run name. Defaults to <scene>_<num_views> (--wandb)")
+    parser.add_argument("--wandb_run_id", type=str, default=None,
+                        help="Resume an existing run instead of minting a fresh id. The "
+                             "default is a new random id per invocation, so re-running a "
+                             "scene never interleaves two pipelines into one run; pass an "
+                             "id here to deliberately land a partial re-run (e.g. --stages "
+                             "1c) on the earlier run.")
+    parser.add_argument("--wandb_log_every", type=int, default=25,
+                        help="Log every N training iterations. The first and last iteration "
+                             "of each loop always log. (--wandb)")
 
     # Hardware & Debug
     parser.add_argument("--gpu", type=int, default=0, help="CUDA GPU device index")
@@ -693,13 +782,41 @@ def main():
 
     start_time = time.time()
 
+    # The run is created here and released immediately: each stage subprocess
+    # resumes it by id, and two writers must never hold it at once.
+    if args.wandb:
+        wb.start_pipeline(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            run_name=args.wandb_run_name or f"{scene_name}_{args.num_views}",
+            group=f"{scene_name}_{args.num_views}",
+            config=vars(args),
+            run_id=args.wandb_run_id,
+            tags=[scene_name, f"{args.num_views}views", args.sfm_backend, args.depth_source],
+            wandb_dir=os.path.join(args.output_dir, "wandb"),
+            every=args.wandb_log_every,
+            dry_run=args.dry_run,
+        )
+        # A stage that fails calls sys.exit from run_command, so the summary has
+        # to be flushed from an exit hook to capture the partial timings.
+        import atexit
+        atexit.register(lambda: wb.finish_pipeline(
+            STAGE_SECONDS, time.time() - start_time, exit_code=1))
+
     # Determine which stages to run.
     # 'wm' is opt-in rather than part of 'all': most scenes carry no watermark,
     # and the detector is only meaningful on a set of photos sharing one overlay.
-    all_stages = ["wm", "sfm", "1a", "1b", "2a", "2b", "3", "4", "5a", "5b", "render"]
+    # '1c' is opt-in for the same reason as 'wm', plus one of its own: it consumes
+    # stage 2a's leave-one-out pairs, so it cannot sit between 1b and 2a in the
+    # default order. It is also an *alternative* to the stage 3-5 diffusion path
+    # rather than a complement -- 5a branches off 1a, so running both just produces
+    # two independent refinements and makes the export pick a winner.
+    all_stages = ["wm", "sfm", "wmi", "1a", "1b", "2a", "2b", "1c", "3", "4", "5a", "5b", "render"]
     if args.stages.strip().lower() == "all":
         stages_to_run = set(all_stages)
         stages_to_run.remove("wm")
+        stages_to_run.remove("wmi")
+        stages_to_run.remove("1c")
         if args.sfm_config == "posed":
             stages_to_run.remove("sfm")
     else:
@@ -747,6 +864,11 @@ def main():
     output_lora_dir = f"output/{lora_exp_dir}"
     output_den_dir = f"output_den{args.num_views}"
     output_inp_dir = f"output_inp{args.num_views}"
+    gsfix_data_root = "output/gsfix_data"
+    gsfix_bundle = f"{gsfix_data_root}/{scene_name}_{args.num_views}"
+    gsfix_ft_dir = "output/gsfixer_finetune"
+    gsfix_fixed_dir = f"{gsfix_bundle}/fixed"
+    gsfix_model_dir = f"output/gs_gsfix/{scene_name}_{args.num_views}"
     final_stage1_ply = f"{output_den_dir}/gaussian_object/{scene_name}_{args.num_views}/save/last.ply"
     final_stage2_ply = f"{output_inp_dir}/gaussian_object/{scene_name}_{args.num_views}/save/last.ply"
 
@@ -768,7 +890,7 @@ def main():
         detected = os.path.join(args.output_dir, "watermark_mask.png")
         cmd = (f"python tools/detect_watermark.py -i {source_path} "
                f"--output_dir {args.output_dir}")
-        run_command(cmd, dry_run=args.dry_run)
+        run_command(cmd, dry_run=args.dry_run, stage="wm")
         if args.dry_run:
             pass
         elif os.path.exists(detected):
@@ -810,6 +932,37 @@ def main():
             log_error(f"Please include 'sfm' in --stages (e.g. '--stages sfm,1' or '--stages all') to run {sfm_label} first.")
             sys.exit(1)
 
+    # =========================================================================
+    # Stage wmi: Watermark Inpainting (opt-in, after SfM, before everything else)
+    # =========================================================================
+    # Stage `wm` only masks the overlay out of the losses, which leaves the
+    # Gaussians behind it unconstrained and novel views rendering garbage there.
+    # This replaces those pixels with plausible content so they can be supervised
+    # -- at reduced weight, via --wm_loss_weight, because they are invented.
+    # Placed before depth prep so --depth_source align also runs Depth-Anything on
+    # the cleaned frames rather than on the overlay.
+    if "wmi" in stages_to_run:
+        log_banner(curr_stage_idx, total_stages, "Stage wmi: Watermark Inpainting")
+        cmd = f"python tools/inpaint_watermark.py -s {effective_source_path}"
+        if args.watermark_mask:
+            cmd += f" --watermark_mask {args.watermark_mask}"
+        run_command(cmd, dry_run=args.dry_run, stage="wmi")
+        if args.wm_loss_weight <= 0 and not args.dry_run:
+            log_warn("Stage wmi ran but --wm_loss_weight is 0, so the inpainted region stays "
+                     "unsupervised and nothing changes for training. Pass e.g. "
+                     "--wm_loss_weight 0.2 to actually use it.")
+        curr_stage_idx += 1
+
+    # A positive weight against un-inpainted photographs would supervise the
+    # watermark itself -- the exact failure stage `wm` exists to prevent.
+    if args.wm_loss_weight > 0 and not args.dry_run:
+        clean_dir = os.path.join(effective_source_path, CLEAN_DIRNAME)
+        if not os.path.isdir(clean_dir):
+            log_error(f"--wm_loss_weight {args.wm_loss_weight} but {clean_dir} does not exist, "
+                      "so the masked pixels still contain the watermark.")
+            log_error(f"Run stage 'wmi' first (e.g. --stages wmi,1) or drop --wm_loss_weight.")
+            sys.exit(1)
+
     # Prepare scene dataset structures & depth priors
     setup_ri3d_scene_data(effective_source_path, image_dir, image_files, num_views=args.num_views,
                           resolution=args.resolution, dry_run=args.dry_run,
@@ -826,7 +979,7 @@ def main():
             f"-r {args.resolution} --sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
             f"--white_background --random_background"
         )
-        run_command(cmd, dry_run=args.dry_run)
+        run_command(cmd, dry_run=args.dry_run, stage="1a")
         log_success(f"Point cloud initialized at {debug_gs_init_dir}/point_cloud/iteration_1/point_cloud.ply")
         curr_stage_idx += 1
 
@@ -841,9 +994,10 @@ def main():
             f"-m {output_gs_init_dir} "
             f"-r {args.resolution} --sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
             f"--white_background --random_background "
-            f"--ply_path {init_ply}"
+            f"--ply_path {init_ply} "
+            f"--wm_loss_weight {args.wm_loss_weight}"
         )
-        run_command(cmd, dry_run=args.dry_run)
+        run_command(cmd, dry_run=args.dry_run, stage="1b")
         log_success(f"Base 3DGS model saved to {output_gs_init_dir}")
         curr_stage_idx += 1
 
@@ -852,15 +1006,31 @@ def main():
     # =========================================================================
     if "2a" in stages_to_run:
         log_banner(curr_stage_idx, total_stages, "Stage 2a: Leave-One-Out Data Generation (Pass 1)")
+        # leave_one_out_stage1.py only writes gt.png when it does not already
+        # exist, so re-running into a populated directory silently keeps the old
+        # targets -- which is how a run predating stage `wmi` leaves watermarked
+        # ground truth behind. left_image/ has no such guard, so a re-run at a
+        # different iteration count also mixes old and new renders.
+        if os.path.isdir(loo_dir) and not args.dry_run:
+            if args.force_loo:
+                log_warn(f"Removing existing {loo_dir}")
+                shutil.rmtree(loo_dir)
+            else:
+                log_error(f"{loo_dir} already exists. Stage 2a keeps any gt.png already there, so "
+                          "a re-run would mix stale targets with fresh renders.")
+                log_error(f"Delete it first (rm -rf {loo_dir}) or pass --force_loo.")
+                sys.exit(1)
         init_ply = f"{debug_gs_init_dir}/point_cloud/iteration_1/point_cloud.ply"
         cmd = (
             f"python -W ignore scripts/leave_one_out_stage1.py -s {effective_source_path} "
             f"-m {loo_dir} "
             f"-r {args.resolution} --sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
             f"--white_background --random_background "
-            f"--ply_path {init_ply}"
+            f"--ply_path {init_ply} "
+            f"--wm_loss_weight {args.wm_loss_weight}"
+            + (f" --loo_iterations {args.loo_iterations}" if args.loo_iterations else "")
         )
-        run_command(cmd, dry_run=args.dry_run)
+        run_command(cmd, dry_run=args.dry_run, stage="2a")
         curr_stage_idx += 1
 
     if "2b" in stages_to_run:
@@ -871,10 +1041,142 @@ def main():
             f"-m {loo_dir} "
             f"-r {args.resolution} --sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
             f"--white_background --random_background "
-            f"--ply_path {init_ply}"
+            f"--ply_path {init_ply} "
+            f"--wm_loss_weight {args.wm_loss_weight}"
+            + (f" --loo_iterations {args.loo_iterations}" if args.loo_iterations else "")
         )
-        run_command(cmd, dry_run=args.dry_run)
+        run_command(cmd, dry_run=args.dry_run, stage="2b")
         log_success(f"Leave-one-out data and parameter noise distributions saved to {loo_dir}")
+        curr_stage_idx += 1
+
+    # =========================================================================
+    # Stage 1c: GSFix3D Repair of the Base 3DGS (opt-in)
+    # =========================================================================
+    # Renders novel views off the stage-1b model, repairs each with GSFixer (a
+    # Marigold/SD2 latent diffusion model), and optimizes the Gaussians against
+    # the repaired images. Independent of stages 3-5: 5a branches off stage 1a,
+    # so this refines 1b for its own sake and for stage 3's --gs_dir.
+    if "1c" in stages_to_run:
+        log_banner(curr_stage_idx, total_stages, "Stage 1c: GSFixer Novel-View Repair")
+
+        if not os.path.isdir(loo_dir) and not args.dry_run:
+            log_error(f"Stage 1c needs leave-one-out pairs, but {loo_dir} does not exist.")
+            log_error(f"Run: python inference.py -i {source_path} -o {args.output_dir} "
+                      f"--stages 2a -n {args.num_views}")
+            log_error("Renders at the training poses are fitted to their own photographs, so "
+                      "without leave-one-out data GSFixer would be fine-tuned on pairs that "
+                      "already match -- teaching it the identity map.")
+            sys.exit(1)
+
+        # --- Export the directory layout GSFixer reads -----------------------
+        cmd = (
+            f"python tools/gsfix_export.py -s {effective_source_path} "
+            f"-m {output_gs_init_dir} --loo_dir {loo_dir} -o {gsfix_bundle} "
+            f"-r {args.resolution} --sparse_view_num {args.num_views} "
+            f"--sh_degree {args.sh_degree} --white_background "
+            f"--pairs_window {args.gsfix_pairs_window}"
+        )
+        # The export auto-discovers the scene's mask, but an explicitly supplied
+        # one has to be forwarded. Without it the fine-tune targets keep the
+        # burned-in watermark and GSFixer learns to repaint it.
+        if args.watermark_mask:
+            cmd += f" --watermark_mask {args.watermark_mask}"
+        run_command(cmd, dry_run=args.dry_run, stage="1c_export")
+
+        # --- Fine-tune GSFixer on this scene ---------------------------------
+        gsfix_checkpoint = os.path.abspath(args.gsfix_ckpt)
+        if args.gsfix_finetune:
+            cfg_dst = os.path.abspath(
+                f"configs/gsfix/{scene_name}_{args.num_views}.yaml")
+            if not args.dry_run:
+                with open("configs/gsfix/finetune_template.yaml") as f:
+                    tpl = f.read()
+                with open(cfg_dst, "w") as f:
+                    # The wandb placeholders are substituted even without
+                    # --wandb, so a hand-run config never creates a project
+                    # literally named __WANDB_PROJECT__.
+                    f.write(tpl.replace("__FINETUNE_DIR__",
+                                        f"{scene_name}_{args.num_views}/finetune")
+                               .replace("__WANDB_PROJECT__", args.wandb_project)
+                               .replace("__WANDB_GROUP__", f"{scene_name}_{args.num_views}"))
+
+            # train.py derives its job name from the config basename.
+            ft_run = os.path.join(gsfix_ft_dir, f"{scene_name}_{args.num_views}")
+            if os.path.isdir(ft_run) and not args.dry_run:
+                # train.py creates the run directory with exist_ok=False, so a
+                # re-run into an existing one aborts before it starts.
+                shutil.rmtree(ft_run)
+
+            # recursive_load_config loads each base_config entry with a bare
+            # OmegaConf.load, i.e. relative to the cwd -- hence running from the
+            # GSFix3D root while --config points back into this repo.
+            cmd = (
+                # PYTHONPATH injects tools/gsfix_compat/sitecustomize.py, which no-ops
+            # diffusers' enable_xformers_memory_efficient_attention. xformers
+            # >=0.0.35 dropped memory_efficient_attention, and GSFix3D calls it
+            # unguarded. Keeps the checkout unmodified; SDPA is used instead.
+            f"cd {args.gsfix_root} && "
+            f"PYTHONPATH={os.path.abspath('tools/gsfix_compat')}${{PYTHONPATH:+:$PYTHONPATH}} "
+            f"python scripts/gsfixer/train.py  "
+                f"--config {cfg_dst} "
+                f"--base_data_dir {os.path.abspath(gsfix_data_root)} "
+                f"--base_ckpt_dir {os.path.abspath(os.path.dirname(args.gsfix_ckpt))} "
+                f"--output_dir {os.path.abspath(gsfix_ft_dir)}"
+                # GSFixer's trainer inits wandb with sync_tensorboard=True, which
+                # takes over the step axis -- it gets its own run in the same
+                # project and group rather than joining the pipeline run.
+                + ("" if args.wandb else " --no_wandb")
+            )
+            run_command(cmd, dry_run=args.dry_run, stage="1c_gsfix_ft", external=True)
+
+            # The trainer saves only unet/ and scheduler/, so the checkpoint is
+            # not a loadable diffusers pipeline until the frozen components are
+            # borrowed back from the base model.
+            # Absolute: the inference command below runs with cwd=<gsfix_root>.
+            gsfix_checkpoint = os.path.abspath(
+                os.path.join(ft_run, "checkpoint", "latest"))
+            if not args.dry_run:
+                base = os.path.abspath(args.gsfix_ckpt)
+                for item in ("model_index.json", "vae", "text_encoder", "tokenizer"):
+                    src = os.path.join(base, item)
+                    dst = os.path.join(gsfix_checkpoint, item)
+                    if os.path.exists(dst) or not os.path.exists(src):
+                        continue
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copyfile(src, dst)
+                log_success(f"Assembled GSFixer pipeline at {gsfix_checkpoint}")
+        else:
+            log_warn("Running GSFixer zero-shot; it has seen no data from this scene.")
+
+        # --- Repair the novel views ------------------------------------------
+        cmd = (
+            # PYTHONPATH injects tools/gsfix_compat/sitecustomize.py, which no-ops
+            # diffusers' enable_xformers_memory_efficient_attention. xformers
+            # >=0.0.35 dropped memory_efficient_attention, and GSFix3D calls it
+            # unguarded. Keeps the checkout unmodified; SDPA is used instead.
+            f"cd {args.gsfix_root} && "
+            f"PYTHONPATH={os.path.abspath('tools/gsfix_compat')}${{PYTHONPATH:+:$PYTHONPATH}} "
+            f"python scripts/gsfixer/inference.py  "
+            f"--checkpoint {gsfix_checkpoint} --recon_method_type ri3d "
+            f"--data_path {os.path.abspath(gsfix_bundle)} "
+            f"--output_dir {os.path.abspath(gsfix_fixed_dir)}"
+        )
+        run_command(cmd, dry_run=args.dry_run, stage="1c_gsfix_infer", external=True)
+
+        # --- Lift the repairs back into the Gaussians ------------------------
+        cmd = (
+            f"python -W ignore scripts/refine_gs_gsfix.py -s {effective_source_path} "
+            f"-m {output_gs_init_dir} "
+            f"--fixed_image_path {gsfix_fixed_dir}/rgb "
+            f"--output_dir {gsfix_model_dir} "
+            f"-r {args.resolution} --sparse_view_num {args.num_views} "
+            f"--sh_degree {args.sh_degree} --white_background "
+            f"--anchor_every {args.gsfix_anchor_every}"
+        )
+        run_command(cmd, dry_run=args.dry_run, stage="1c_lift")
+        log_success(f"Stage 1c complete. Refined model at {gsfix_model_dir}")
         curr_stage_idx += 1
 
     # =========================================================================
@@ -892,7 +1194,7 @@ def main():
             f"--bg_white --sd_locked --train_lora "
             f"--add_diffusion_lora --add_control_lora --add_clip_lora"
         )
-        run_command(cmd, dry_run=args.dry_run)
+        run_command(cmd, dry_run=args.dry_run, stage="3")
         log_success(f"Trained ControlNet LoRA checkpoint saved to {output_lora_dir}")
         curr_stage_idx += 1
 
@@ -910,7 +1212,7 @@ def main():
                 f"--output_dir={inpainting_target_dir} "
                 f"--resolution=512 --train_batch_size=16 --max_train_steps=2000"
             )
-            run_command(cmd, dry_run=args.dry_run)
+            run_command(cmd, dry_run=args.dry_run, stage="4")
         else:
             log_warn("External train_realfill.py not found; using base SD2 Inpainting checkpoint.")
             os.makedirs(inpainting_target_dir, exist_ok=True)
@@ -938,7 +1240,7 @@ def main():
             f"data.refresh_size=8 "
             f"system.sh_degree={args.sh_degree}"
         )
-        run_command(cmd, dry_run=args.dry_run)
+        run_command(cmd, dry_run=args.dry_run, stage="5a")
         log_success(f"Stage 5a (Repair) completed. Saved to {output_den_dir}")
         curr_stage_idx += 1
 
@@ -965,7 +1267,7 @@ def main():
             f"data.refresh_size=10 "
             f"system.sh_degree={args.sh_degree}"
         )
-        run_command(cmd, dry_run=args.dry_run)
+        run_command(cmd, dry_run=args.dry_run, stage="5b")
         log_success(f"Stage 5b (Inpainting Refinement) completed. Saved to {output_inp_dir}")
         curr_stage_idx += 1
 
@@ -992,8 +1294,13 @@ def main():
                     continue
         return max(iters)[1] if iters else None
 
+    # 5b > 5a > 1c > 1b. Stage 1c refines 1b, so whenever it has run its output
+    # supersedes the base model; the diffusion stages still win because they
+    # branch off 1a and carry both priors.
     best_ply = final_stage2_ply if os.path.exists(final_stage2_ply) else (
-        final_stage1_ply if os.path.exists(final_stage1_ply) else _latest_gs_ply(output_gs_init_dir)
+        final_stage1_ply if os.path.exists(final_stage1_ply) else (
+            _latest_gs_ply(gsfix_model_dir) or _latest_gs_ply(output_gs_init_dir)
+        )
     )
 
     if args.render_video and ("render" in stages_to_run or "5b" in stages_to_run or "5a" in stages_to_run or "1b" in stages_to_run):
@@ -1008,7 +1315,7 @@ def main():
                 f"--postfix _stage2 "
                 f"--load_ply {ply_to_render}"
             )
-            run_command(cmd, dry_run=args.dry_run)
+            run_command(cmd, dry_run=args.dry_run, stage="render")
             log_success("Novel-view video rendered.")
         else:
             log_warn("No trained PLY model found to render video.")
@@ -1020,6 +1327,7 @@ def main():
         log_success(f"Exported final 3DGS scene to: {dest_ply}")
 
     total_time = time.time() - start_time
+    wb.finish_pipeline(STAGE_SECONDS, total_time, exit_code=0)
     print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*75}{Colors.ENDC}")
     print(f"{Colors.BOLD}{Colors.GREEN}   🎉 RI3D Reconstruction Finished Successfully! ({total_time:.1f}s){Colors.ENDC}")
     print(f"{Colors.BOLD}{Colors.GREEN}{'='*75}{Colors.ENDC}\n")

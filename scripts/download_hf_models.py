@@ -19,3 +19,14 @@ snapshot_download(
     repo_id="sd2-community/stable-diffusion-2-inpainting",
     local_dir="models/stable-diffusion-2-inpainting",
 )
+
+# GSFixer base checkpoint (used as base for the Stage 1c repair prior).
+# `gsfixer-base` is the single-condition variant: its UNet takes 8 latent
+# channels (4 noise + 4 render). The `gsfixer-full` sibling takes 12, the extra
+# 4 being a mesh render -- RI3D has no mesh, so the base model is the right one.
+# GSFix3D's trainer resolves the checkpoint as <base_ckpt_dir>/<pretrained_path>,
+# so this must be a real local directory and not just a hub cache entry.
+snapshot_download(
+    repo_id="goldoak1421/gsfixer-base",
+    local_dir="models/gsfixer-base",
+)

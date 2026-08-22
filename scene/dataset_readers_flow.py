@@ -32,6 +32,7 @@ from scene.gaussian_model import BasicPointCloud
 from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2, transform_pcd
 from utils.image_utils import load_meshlab_file
 from utils.camera_utils import transform_cams, CameraInfo, generate_ellipse_path_from_camera_infos
+from utils.watermark_utils import resolve_image_path
 
 from utils.bilateral_filtering import sparse_bilateral_filtering
 
@@ -117,7 +118,10 @@ def readMipTransforms(path, resolution=4):
         FovY = focal2fov(focal_length_y, height)
         FovX = focal2fov(focal_length_x, width)
 
-        image_path = osp.join(path, impath)
+        # Swaps in <sfm_dir>/images_wmclean/<stem>.png when stage `wmi` has run.
+        # The stem is preserved, so depth_rel and the train/test split still key
+        # off the same name.
+        image_path = resolve_image_path(osp.join(path, impath))
         image_name = osp.basename(image_path).split(".")[0]
         image = None#Image.open(image_path)
 
@@ -380,7 +384,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, extra_opts=None, ply_ini
 
     watermark_mask = _find_watermark_mask(train_cam_infos[0]) if train_cam_infos else None
     if watermark_mask is not None:
-        print(f"[i] Watermark loss mask: ignoring {(1 - watermark_mask).mean() * 100:.2f}% "
+        covered = (1 - watermark_mask).mean() * 100
+        w = float(getattr(extra_opts, "wm_loss_weight", 0.0))
+        how = "ignoring" if w <= 0 else f"weighting at {w:g}"
+        print(f"[i] Watermark loss mask: {how} {covered:.2f}% "
               "of every training pixel (photometric losses only).")
 
     for idx, cam_info in enumerate(train_cam_infos):

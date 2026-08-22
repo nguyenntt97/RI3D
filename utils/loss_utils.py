@@ -68,11 +68,18 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True, return_ma
         return ssim_map.mean(1).mean(1).mean(1)
 
 def masked_l1_loss(network_output, gt, mask):
-    """L1 over supervised pixels only. `mask` is 1 = supervise, 0 = ignore.
+    """Weighted L1. `mask` is a per-pixel weight: 1 = full, 0 = ignore entirely.
 
-    Normalised by the number of supervised pixels, not by the frame, so masking
-    does not quietly scale the loss down and change its balance against the other
-    terms. `mask` broadcasts over channels.
+    Originally binary (1 = supervise, 0 = ignore, for burned-in watermarks).
+    Fractional weights are now also meaningful: where a watermark has been painted
+    out by `utils/watermark_utils.py`, the pixels carry *plausible* content rather
+    than true content, and should pull on the model less than a real photograph
+    without being discarded. The expression below was already a weighted mean, so
+    it generalises unchanged.
+
+    Normalised by the total weight, not by the frame, so downweighting does not
+    quietly shrink the loss and rebalance it against the other terms. `mask`
+    broadcasts over channels.
     """
     if mask is None:
         return l1_loss(network_output, gt)
@@ -84,15 +91,21 @@ def masked_l1_loss(network_output, gt, mask):
 
 
 def masked_ssim(img1, img2, mask, window_size=11, size_average=True):
-    """SSIM restricted to windows that contain no ignored pixel.
+    """SSIM weighted by the least-trusted pixel under each window.
 
-    SSIM is windowed, so an elementwise mask still lets watermark pixels leak into
-    every window that overlaps them. Eroding the valid mask by the window radius
-    keeps only fully-clean windows -- the effective mask is therefore larger than
-    the one supplied, which is the safe direction.
+    SSIM is windowed, so an elementwise weight still lets low-trust pixels leak
+    into every window that overlaps them. Each window is therefore given the
+    *minimum* weight under it, which is erosion generalised to real-valued
+    weights:
 
-    Falls back to plain SSIM when erosion leaves nothing, which happens only if
-    the mask covers essentially the whole frame.
+      - binary mask (1/0): a window scores 1 only if every pixel under it is
+        supervised, and 0 otherwise -- the previous erosion behaviour.
+      - soft mask (1 outside, w inside): windows touching the downweighted region
+        score w, fully-clean windows score 1.
+
+    Either way the effective mask is at least as large as the one supplied, which
+    is the safe direction. Falls back to plain SSIM when nothing survives, which
+    happens only if the weight is zero over essentially the whole frame.
     """
     if mask is None:
         return ssim(img1, img2, window_size=window_size, size_average=size_average)
@@ -110,8 +123,16 @@ def masked_ssim(img1, img2, mask, window_size=11, size_average=True):
         m = m[None, None]
     elif m.dim() == 3:
         m = m[None]
-    # Erode: a window is clean only if every pixel under it is supervised.
-    valid = (F.avg_pool2d(m, window_size, stride=1, padding=window_size // 2) >= 1.0 - 1e-6)
+    # Min-pool = erosion for a binary mask, and the natural weighted analogue for
+    # a soft one. (-max_pool(-x) is min_pool; torch has no min_pool2d.)
+    #
+    # This also drops an incidental behaviour of the avg_pool2d version it
+    # replaces: that pooled with count_include_pad=True, so the zero padding at
+    # the frame border pulled every border window below the threshold and silently
+    # excluded a `window_size // 2` ring from the SSIM term -- 2.27% of pixels on
+    # sceneC, and only ever on scenes that had a mask at all. Max-pool ignores
+    # padding, so masked and unmasked scenes now treat borders alike.
+    valid = -F.max_pool2d(-m, window_size, stride=1, padding=window_size // 2)
     # _ssim preserves its input's rank, so ssim_map is (C, H, W) when called from
     # training (every call site passes CHW) and (N, C, H, W) when batched. Drop the
     # leading dims added for avg_pool2d back down to match before expanding.
@@ -120,7 +141,7 @@ def masked_ssim(img1, img2, mask, window_size=11, size_average=True):
     valid = valid.to(img1.dtype).expand_as(ssim_map)
 
     total = valid.sum()
-    if total < 1:
+    if total < 1e-6:
         return ssim_map.mean()
     return (ssim_map * valid).sum() / total
 

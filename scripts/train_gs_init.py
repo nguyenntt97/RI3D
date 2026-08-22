@@ -28,6 +28,7 @@ from scene import GaussianModel, Scene
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim, monodisp, l2_loss
+from utils import wandb_utils as wb
 from torch.utils.tensorboard.writer import SummaryWriter
 
 TENSORBOARD_FOUND = True
@@ -82,6 +83,7 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
     # per-view counts (the same reason --depth_conf_thr is unsupported here, see
     # docs/point_map.md 4). Stage 1b's first densify_and_prune then removes them,
     # since it prunes below opacity 0.005.
+    n_dead = 0
     if getattr(gaussians, "masks", None) is not None:
         dead = gaussians.masks.reshape(-1) <= 0
         n_dead = int(dead.sum())
@@ -89,6 +91,18 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
             gaussians._opacity.data[dead] = -10.0  # sigmoid(-10) ~ 4.5e-5
             print(f"[i] Watermark mask: zeroed opacity on {n_dead:,} of "
                   f"{dead.numel():,} init points ({n_dead / dead.numel() * 100:.2f}%)")
+
+    # This stage exits below without ever entering the training loop, so there is
+    # no loss to report -- only what the initialization produced.
+    # get_xyz, not _xyz: under mono_d_so_enable the positions are derived from
+    # the per-view depth (_z) and _xyz stays empty until the model is saved.
+    n_init = int(gaussians.get_xyz.shape[0])
+    wb.attach()
+    wb.log_summary({"stage_1a/n_init_points": n_init,
+                    "stage_1a/n_wm_dead": n_dead,
+                    "stage_1a/wm_dead_frac": (n_dead / n_init) if n_init else 0.0,
+                    "stage_1a/image_h": H, "stage_1a/image_w": W})
+    wb.finish()
 
     scene.save(first_iter)
     exit()

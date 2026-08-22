@@ -39,9 +39,13 @@ import os
 import os.path as osp
 import sys
 
+sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
+
 import cv2
 import numpy as np
 from scipy import ndimage
+
+from utils import wandb_utils as wb
 
 VALID_EXTS = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
 
@@ -185,6 +189,15 @@ def main():
     ap.set_defaults(fill_boxes=True)
     args = ap.parse_args()
 
+    wb.attach()
+    stats = {}
+
+    def _done(code):
+        """Every exit path reports what was measured before it bailed."""
+        wb.log_summary(stats)
+        wb.finish()
+        return code
+
     scene_path = osp.abspath(args.scene_path)
     output_dir = osp.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -192,6 +205,7 @@ def main():
     image_dir = resolve_image_dir(scene_path)
     stack, names, first_path = load_stack(image_dir)
     n_views, H, W = stack.shape
+    stats["stage_wm/n_views"] = n_views
     print(f"[INFO] {n_views} view(s) from {image_dir} at {W}x{H}")
     if n_views < 5:
         print("[WARN] Fewer than 5 views. This detector separates watermark edges from scene "
@@ -200,6 +214,8 @@ def main():
 
     gmin = edge_persistence(stack)
     p95, p99 = float(np.percentile(gmin, 95)), float(np.percentile(gmin, 99))
+    stats.update({"stage_wm/edge_p95": p95, "stage_wm/edge_p99": p99,
+                  "stage_wm/threshold": args.threshold})
     print(f"[INFO] cross-view edge persistence: p95 {p95:.1f}  p99 {p99:.1f}  "
           f"(threshold {args.threshold:.0f})")
 
@@ -209,17 +225,20 @@ def main():
     if p99 < args.threshold:
         print(f"[INFO] No watermark detected (p99 {p99:.1f} < {args.threshold:.0f}). "
               "No mask written; the SfM stage will use every pixel.")
-        return 0
+        stats["stage_wm/detected"] = 0
+        return _done(0)
 
     mask, boxes = build_mask(
         gmin, args.threshold, args.dilate, args.min_component, args.fill_boxes,
         args.merge_distance,
     )
     coverage = float(mask.mean())
+    stats.update({"stage_wm/coverage": coverage, "stage_wm/n_components": len(boxes)})
 
     if not boxes:
         print("[INFO] Nothing survived component filtering; no mask written.")
-        return 0
+        stats["stage_wm/detected"] = 0
+        return _done(0)
 
     print(f"[INFO] {len(boxes)} component(s), {coverage * 100:.2f}% of the frame masked")
     for x0, y0, x1, y1, px in boxes[:20]:
@@ -233,6 +252,7 @@ def main():
     # watermark. Anything under sceneA's clean-scene p99 (24.7) is indistinguishable
     # from ordinary persistent scene structure and not worth chasing.
     leak = int(((gmin > max(40.0, p95)) & ~mask).sum())
+    stats.update({"stage_wm/leak_px": leak, "stage_wm/leak_frac": leak / mask.size})
     print(f"[INFO] residual persistent edge outside the mask: {leak} px "
           f"({leak / mask.size * 100:.3f}% of frame)"
           + ("" if leak < 2000 else "  <- consider lowering --threshold or --fill_boxes"))
@@ -242,7 +262,8 @@ def main():
               f"{args.max_coverage * 100:.0f}% ceiling. That means the detection is wrong, not "
               "that the watermark is huge -- most likely the views are too similar for scene "
               "edges to move. Raise --threshold, or hand a drawn mask to --watermark_mask.")
-        return 1
+        stats.update({"stage_wm/detected": 0, "stage_wm/aborted_coverage": 1})
+        return _done(1)
 
     mask_path = osp.join(output_dir, "watermark_mask.png")
     preview_path = osp.join(output_dir, "watermark_preview.png")
@@ -250,7 +271,8 @@ def main():
     write_preview(preview_path, first_path, mask)
     print(f"[INFO] wrote {mask_path}")
     print(f"[INFO] wrote {preview_path}  <- check this before trusting the mask")
-    return 0
+    stats["stage_wm/detected"] = 1
+    return _done(0)
 
 
 if __name__ == "__main__":
