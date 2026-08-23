@@ -165,6 +165,78 @@ def check_checkpoints(args):
         log_warn("Attempting to proceed anyway (if using custom paths or online loading)...")
 
 
+def _gsfix_has_unet_weights(ckpt_dir):
+    unet = os.path.join(ckpt_dir, "unet")
+    return any(os.path.isfile(os.path.join(unet, name)) for name in
+               ("diffusion_pytorch_model.safetensors", "diffusion_pytorch_model.bin"))
+
+
+def resolve_gsfix_checkpoint(ckpt_root):
+    """Newest GSFixer checkpoint that actually contains UNet weights, or None.
+
+    `latest` is written non-atomically: save_checkpoint renames the previous one
+    to `_old_latest`, then writes unet/config.json before the weights, and only
+    removes the backup as its last statement. A crash in between -- a full disk
+    is the usual one, and the UNet plus its 6.9 GB optimizer state make that
+    easy -- leaves a `latest` that looks like a checkpoint and holds no model.
+    The per-improvement `iter_<n>` copies are never rewritten, so the newest
+    complete one is the right fallback.
+    """
+    if not os.path.isdir(ckpt_root):
+        return None
+
+    latest = os.path.join(ckpt_root, "latest")
+    if _gsfix_has_unet_weights(latest):
+        return latest
+
+    candidates = []
+    for name in os.listdir(ckpt_root):
+        # `_old_iter_*` is debris from an interrupted write, not a checkpoint.
+        if not name.startswith("iter_"):
+            continue
+        path = os.path.join(ckpt_root, name)
+        if os.path.isdir(path) and _gsfix_has_unet_weights(path):
+            try:
+                candidates.append((int(name.split("_")[-1]), path))
+            except ValueError:
+                continue
+    return max(candidates)[1] if candidates else None
+
+
+def prune_gsfix_checkpoints(ckpt_root, keep_dir=None):
+    """Drop the parts of a finished fine-tune that only a resumed run would read.
+
+    `trainer.ckpt` is Adam's two moment tensors for an 865M-parameter UNet in
+    fp32 -- 6.9 GB, twice the weights themselves -- and is written on every
+    `latest` save. Nothing here can consume it: the run directory is deleted
+    before each fine-tune (see stage 1c), so GSFix3D's --resume_run is already
+    unreachable. `_old_*` directories are the pre-write backups, left behind
+    only when a save died partway.
+    """
+    if not os.path.isdir(ckpt_root):
+        return 0
+
+    def _size(path):
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        return sum(os.path.getsize(os.path.join(root, f))
+                   for root, _, files in os.walk(path) for f in files
+                   if os.path.isfile(os.path.join(root, f)))
+
+    freed = 0
+    for name in sorted(os.listdir(ckpt_root)):
+        path = os.path.join(ckpt_root, name)
+        if name.startswith("_old_") and os.path.isdir(path) and path != keep_dir:
+            freed += _size(path)
+            shutil.rmtree(path, ignore_errors=True)
+    for root, _, files in os.walk(ckpt_root):
+        if "trainer.ckpt" in files:
+            state = os.path.join(root, "trainer.ckpt")
+            freed += _size(state)
+            os.remove(state)
+    return freed
+
+
 def validate_and_standardize_images(input_path, auto_orient=True, dry_run=False, num_views=3):
     """
     Check that all input photos have consistent orientations (all landscape or all portrait).
@@ -672,6 +744,14 @@ def parse_args():
                              "repairing (stage 1c)")
     parser.add_argument("--no_gsfix_finetune", dest="gsfix_finetune", action="store_false",
                         help="Run GSFixer zero-shot from the base checkpoint instead")
+    parser.add_argument("--gsfix_reuse_finetune", action="store_true",
+                        help="Skip the stage-1c fine-tune when a previous one already left "
+                             "usable UNet weights under output/gsfixer_finetune/<scene>_<n>/"
+                             "checkpoint. Without this the run directory is deleted and the "
+                             "fine-tune repeats from scratch (~1.5 h for 800 iterations), "
+                             "which is wasted work when only the later sub-steps failed. "
+                             "Unlike --no_gsfix_finetune this keeps using the scene's own "
+                             "fine-tuned weights rather than falling back to the base model.")
     parser.add_argument("--gsfix_pairs_window", type=int, default=240,
                         help="Keep leave-one-out samples within this many iterations of the "
                              "first (stage 1c). Past iteration 6000 the leave-one-out model "
@@ -1086,56 +1166,83 @@ def main():
         # --- Fine-tune GSFixer on this scene ---------------------------------
         gsfix_checkpoint = os.path.abspath(args.gsfix_ckpt)
         if args.gsfix_finetune:
-            cfg_dst = os.path.abspath(
-                f"configs/gsfix/{scene_name}_{args.num_views}.yaml")
-            if not args.dry_run:
-                with open("configs/gsfix/finetune_template.yaml") as f:
-                    tpl = f.read()
-                with open(cfg_dst, "w") as f:
-                    # The wandb placeholders are substituted even without
-                    # --wandb, so a hand-run config never creates a project
-                    # literally named __WANDB_PROJECT__.
-                    f.write(tpl.replace("__FINETUNE_DIR__",
-                                        f"{scene_name}_{args.num_views}/finetune")
-                               .replace("__WANDB_PROJECT__", args.wandb_project)
-                               .replace("__WANDB_GROUP__", f"{scene_name}_{args.num_views}"))
-
             # train.py derives its job name from the config basename.
             ft_run = os.path.join(gsfix_ft_dir, f"{scene_name}_{args.num_views}")
-            if os.path.isdir(ft_run) and not args.dry_run:
-                # train.py creates the run directory with exist_ok=False, so a
-                # re-run into an existing one aborts before it starts.
-                shutil.rmtree(ft_run)
+            ckpt_root = os.path.abspath(os.path.join(ft_run, "checkpoint"))
 
-            # recursive_load_config loads each base_config entry with a bare
-            # OmegaConf.load, i.e. relative to the cwd -- hence running from the
-            # GSFix3D root while --config points back into this repo.
-            cmd = (
-                # PYTHONPATH injects tools/gsfix_compat/sitecustomize.py, which no-ops
-            # diffusers' enable_xformers_memory_efficient_attention. xformers
-            # >=0.0.35 dropped memory_efficient_attention, and GSFix3D calls it
-            # unguarded. Keeps the checkout unmodified; SDPA is used instead.
-            f"cd {args.gsfix_root} && "
-            f"PYTHONPATH={os.path.abspath('tools/gsfix_compat')}${{PYTHONPATH:+:$PYTHONPATH}} "
-            f"python scripts/gsfixer/train.py  "
-                f"--config {cfg_dst} "
-                f"--base_data_dir {os.path.abspath(gsfix_data_root)} "
-                f"--base_ckpt_dir {os.path.abspath(os.path.dirname(args.gsfix_ckpt))} "
-                f"--output_dir {os.path.abspath(gsfix_ft_dir)}"
-                # GSFixer's trainer inits wandb with sync_tensorboard=True, which
-                # takes over the step axis -- it gets its own run in the same
-                # project and group rather than joining the pipeline run.
-                + ("" if args.wandb else " --no_wandb")
-            )
-            run_command(cmd, dry_run=args.dry_run, stage="1c_gsfix_ft", external=True)
+            # Resolving only reads the directory, so this runs under --dry_run
+            # too and the printed plan shows whether training would be skipped.
+            reused = (resolve_gsfix_checkpoint(ckpt_root)
+                      if args.gsfix_reuse_finetune else None)
+
+            if reused is not None:
+                log_success(f"Reusing the existing fine-tune at {reused}")
+            else:
+                if args.gsfix_reuse_finetune:
+                    log_warn(f"--gsfix_reuse_finetune: nothing under {ckpt_root} holds "
+                             "UNet weights, so the fine-tune runs from scratch.")
+                cfg_dst = os.path.abspath(
+                    f"configs/gsfix/{scene_name}_{args.num_views}.yaml")
+                if not args.dry_run:
+                    with open("configs/gsfix/finetune_template.yaml") as f:
+                        tpl = f.read()
+                    with open(cfg_dst, "w") as f:
+                        # The wandb placeholders are substituted even without
+                        # --wandb, so a hand-run config never creates a project
+                        # literally named __WANDB_PROJECT__.
+                        f.write(tpl.replace("__FINETUNE_DIR__",
+                                            f"{scene_name}_{args.num_views}/finetune")
+                                   .replace("__WANDB_PROJECT__", args.wandb_project)
+                                   .replace("__WANDB_GROUP__", f"{scene_name}_{args.num_views}"))
+
+                if os.path.isdir(ft_run) and not args.dry_run:
+                    # train.py creates the run directory with exist_ok=False, so a
+                    # re-run into an existing one aborts before it starts.
+                    shutil.rmtree(ft_run)
+
+                # recursive_load_config loads each base_config entry with a bare
+                # OmegaConf.load, i.e. relative to the cwd -- hence running from the
+                # GSFix3D root while --config points back into this repo.
+                cmd = (
+                    # PYTHONPATH injects tools/gsfix_compat/sitecustomize.py, which
+                    # no-ops diffusers' xformers path. xformers >=0.0.35 dropped
+                    # memory_efficient_attention, and GSFix3D calls it unguarded.
+                    # Keeps the checkout unmodified; SDPA is used instead.
+                    f"cd {args.gsfix_root} && "
+                    f"PYTHONPATH={os.path.abspath('tools/gsfix_compat')}${{PYTHONPATH:+:$PYTHONPATH}} "
+                    f"python scripts/gsfixer/train.py "
+                    f"--config {cfg_dst} "
+                    f"--base_data_dir {os.path.abspath(gsfix_data_root)} "
+                    f"--base_ckpt_dir {os.path.abspath(os.path.dirname(args.gsfix_ckpt))} "
+                    f"--output_dir {os.path.abspath(gsfix_ft_dir)}"
+                    # GSFixer's trainer inits wandb with sync_tensorboard=True, which
+                    # takes over the step axis -- it gets its own run in the same
+                    # project and group rather than joining the pipeline run.
+                    + ("" if args.wandb else " --no_wandb")
+                )
+                run_command(cmd, dry_run=args.dry_run, stage="1c_gsfix_ft", external=True)
 
             # The trainer saves only unet/ and scheduler/, so the checkpoint is
             # not a loadable diffusers pipeline until the frozen components are
             # borrowed back from the base model.
             # Absolute: the inference command below runs with cwd=<gsfix_root>.
-            gsfix_checkpoint = os.path.abspath(
-                os.path.join(ft_run, "checkpoint", "latest"))
+            gsfix_checkpoint = os.path.join(ckpt_root, "latest")
             if not args.dry_run:
+                # Not always `latest`: that one is rewritten in place on every
+                # save and can be left without weights if the write died.
+                resolved = resolve_gsfix_checkpoint(ckpt_root)
+                if resolved is None:
+                    log_error(f"No GSFixer checkpoint under {ckpt_root} contains UNet "
+                              "weights, so the fine-tune produced nothing usable.")
+                    log_error("Check the trainer log for a failed save (a full disk is "
+                              "the usual cause -- one checkpoint is ~10 GB and the write "
+                              "briefly needs twice that).")
+                    sys.exit(1)
+                if resolved != gsfix_checkpoint:
+                    log_warn(f"{gsfix_checkpoint} has no UNet weights; falling back to "
+                             f"{os.path.basename(resolved)}")
+                gsfix_checkpoint = resolved
+
                 base = os.path.abspath(args.gsfix_ckpt)
                 for item in ("model_index.json", "vae", "text_encoder", "tokenizer"):
                     src = os.path.join(base, item)
@@ -1147,6 +1254,13 @@ def main():
                     else:
                         shutil.copyfile(src, dst)
                 log_success(f"Assembled GSFixer pipeline at {gsfix_checkpoint}")
+
+                # Only a resumed run reads these, and the run directory is wiped
+                # before every fine-tune, so resuming is already impossible.
+                freed = prune_gsfix_checkpoints(ckpt_root, keep_dir=gsfix_checkpoint)
+                if freed:
+                    log_success(f"Reclaimed {freed / 1e9:.1f} GB of optimizer state "
+                                "and interrupted-save backups")
         else:
             log_warn("Running GSFixer zero-shot; it has seen no data from this scene.")
 

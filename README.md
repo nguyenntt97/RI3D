@@ -83,6 +83,27 @@ python viz.py -i output/sceneA --save sceneA.rrd --serve --port 9876
 python viz.py -i output/sceneA --serve --port 9876 --timeline
 ```
 
+### 3. Isometric Dollhouse Viewer (`scripts/view_gs_web.py`)
+
+Renders a finished 3DGS model in the browser (viser + nerfview + gsplat) with the post-processing
+an **indoor** scan needs before an isometric view shows anything. A room is photographed from
+inside, so the ceiling sits between an elevated camera and the room; the ceiling is detected from
+the height distribution and removed at view time, leaving a dollhouse view under a genuine
+orthographic projection. Requires `uv sync --extra viewer`.
+
+```bash
+# Serve web viewer (open http://localhost:8080 in your browser)
+python scripts/view_gs_web.py -m output/gs_gsfix/sceneC_6 \
+    -c output/sceneC/ggpt_sfm/cameras.json --port 8080
+
+# Headless: before / ceiling cut / full dollhouse, plus four corner views
+python scripts/view_gs_web.py -m output/gs_gsfix/sceneC_6 \
+    -c output/sceneC/ggpt_sfm/cameras.json --screenshot out/iso
+```
+
+See [`docs/dollhouse.md`](docs/dollhouse.md) for the derivation and the measurements behind the
+defaults.
+
 ---
 
 ## Original Work & Citation

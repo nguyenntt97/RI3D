@@ -14,7 +14,8 @@ The pipeline falls into three phases: build geometry (0–1), build the priors (
 against them (5).
 
 Depth-prior details, coordinate conventions and a set of related defects are documented separately
-in [`point_map.md`](point_map.md).
+in [`point_map.md`](point_map.md); isometric dollhouse rendering of an indoor result, in
+[`dollhouse.md`](dollhouse.md).
 
 ---
 
@@ -37,6 +38,7 @@ in [`point_map.md`](point_map.md).
 | `5a` | `scripts/train_repair.py` + `configs/gaussian-object.yaml` | `output_den${N}/gaussian_object/${SCENE}_${N}` |
 | `5b` | `scripts/train_repair.py` + `configs/gaussian-object_inp.yaml` | `output_inp${N}/gaussian_object/${SCENE}_${N}` |
 | `render` | `scripts/render.py` | orbit video + exported PLY |
+| `view` | `scripts/view_gs_web.py` (not a stage) | browser viewer / isometric PNGs |
 
 ---
 
@@ -238,6 +240,27 @@ python inference.py -i examples/sceneC -o output/sceneC --sfm_config unposed -n 
 Needs `models/gsfixer-base` (`scripts/download_hf_models.py`). Use the **base** checkpoint, not
 `gsfixer-full`: RI3D has no mesh, and full's UNet expects a 12-channel latent against base's 8.
 
+**Re-running 1c.** The fine-tune is by far the longest sub-step (~1.5 h for the default 800
+iterations), and the run directory is deleted before each one, so a plain re-run repeats it even
+when only the repair or lift failed. `--gsfix_reuse_finetune` skips it when
+`output/gsfixer_finetune/<scene>_<n>/checkpoint` already resolves to usable UNet weights, and
+falls back to training with a warning when it does not. This is not `--no_gsfix_finetune`: that
+one abandons the scene's weights and runs the base model zero-shot.
+
+**Disk.** The fine-tune is the most space-hungry step in the pipeline. GSFix3D writes its
+resumable `latest` checkpoint as the 3.5 GB UNet *plus* `trainer.ckpt`, which is Adam's two
+moment tensors for an 865M-parameter model in fp32 — **6.9 GB, twice the weights**. It also keeps
+one 3.5 GB `iter_<n>` copy per validation improvement, and `save_checkpoint` renames the previous
+`latest` to `_old_latest` before writing the new one and only deletes it as its last step, so a
+save briefly needs **~21 GB free**. Running out mid-write leaves a `latest` holding
+`unet/config.json` and no weights.
+
+`inference.py` handles both: it resolves the newest checkpoint that actually contains UNet
+weights (falling back from `latest` to the newest `iter_<n>`), and after assembling the pipeline
+it deletes `trainer.ckpt` and any `_old_*` directories — nothing can read them, since the run
+directory is wiped before every fine-tune, so `--resume_run` is unreachable either way. Steady
+state drops from ~17 GB to ~7 GB per scene.
+
 **Why it is opt-in rather than part of `all`.** It consumes stage 2a's output, so it cannot sit
 between 1b and 2a in the default order. It is also an *alternative* to the stage 3–5 diffusion
 path rather than a complement: 5a branches off stage **1a**, so running both just produces two
@@ -376,6 +399,59 @@ preferring 5b → 5a → the highest-iteration stage-1b checkpoint.
 
 ---
 
+## Viewing an indoor result
+
+`scripts/view_gs_web.py` serves any stage's PLY in a browser through viser + nerfview + gsplat,
+and adds the post-processing an **indoor** scan needs before an isometric view shows anything: a
+room is photographed from inside, so every Gaussian on the ceiling sits between an elevated camera
+and the room, and a top-down view renders the underside of a roof.
+
+```bash
+uv sync --extra viewer      # viser + nerfview; nothing in the pipeline imports them
+
+# interactive
+python scripts/view_gs_web.py -m output/gs_gsfix/sceneC_6 \
+    -c output/sceneC/ggpt_sfm/cameras.json --port 8080
+
+# headless — before / ceiling cut / full dollhouse, plus four corner views
+python scripts/view_gs_web.py -m output/gs_gsfix/sceneC_6 \
+    -c output/sceneC/ggpt_sfm/cameras.json --screenshot out/iso
+```
+
+`-m` takes a PLY **or** a model directory, in which case the highest `point_cloud/iteration_*`
+wins — iteration counts are not fixed in this repo. Stage `1c` is the intended input, but nothing
+here is stage-specific: 1b, 5a and 5b are all plain 3DGS PLYs. `-c` is optional but wanted: the
+SfM cameras are the only reliable source of the world up axis.
+
+`utils/dollhouse_utils.py` holds the geometry and runs standalone (`-m`, `-c`) to print the height
+histogram and the detected levels without opening a browser.
+
+Three sliders, all **view-time** filters — nothing is written back to the PLY, so each costs one
+masked index rather than a reload:
+
+| control | flag | default | what it does |
+|---|---|---|---|
+| Ceiling cut | `--cut` | detected | drops everything above a height, found from the opacity-weighted height histogram |
+| Near-wall slab | `--wall_frac` | 0.0 (off) | also drops a slab off the one or two walls facing the camera. 0.06–0.12 reads well |
+| Room box tightness | `--percentile` | 2.0 | where the robust room box is drawn, which sets both the floater crop and the framing |
+
+The projection is really orthographic (gsplat `camera_model="ortho"`), not a long-lens perspective
+fake. `--sh_degree 0` is worth trying: an isometric camera sits far outside the distribution of
+viewing directions the model was supervised on, so the higher SH bands extrapolate into colour
+artefacts.
+
+> ⚠ **Check `prominence` before trusting the cut.** It is the ceiling spike's height above the room
+> plateau. sceneC scores 1.00; sceneA scores **0.09** and is reported `[LOW CONFIDENCE]`, because it
+> has no distinct ceiling plane to find. The fallback there is a cut at 90% of the height range,
+> which is a framing convenience and **not** a detection.
+
+The derivation, the measurements behind every default, and the defects found while building it —
+including why backface culling is unavailable on stage 1c's isotropic Gaussians (though it would
+work on a stage-5 export) and why a generic 3DGS viewer reads this repo's spherical harmonics in
+the wrong order — are in [`dollhouse.md`](dollhouse.md).
+
+---
+
 ## Dependency graph
 
 ```
@@ -493,9 +569,12 @@ Use `--stages sfm,1` rather than `--stages 1` for raw photos — `1` alone skips
 | `--gsfix_root` | `…/projects/GSFix3D` | stage 1c only; path to the GSFix3D checkout |
 | `--gsfix_ckpt` | `models/gsfixer-base` | stage 1c only; must be the 8-channel *base* variant |
 | `--no_gsfix_finetune` | off | stage 1c only; skip scene fine-tuning and run GSFixer zero-shot |
+| `--gsfix_reuse_finetune` | off | stage 1c only; reuse an existing fine-tune instead of retraining it |
 | `--gsfix_pairs_window` | 240 | stage 1c only; leave-one-out iterations kept as fine-tuning pairs |
 | `--gsfix_anchor_every` | 1 | stage 1c only; sparse-photograph steps interleaved into the lift |
 | `--no_watermark_clean` | off | `gsfix_export.py` only; keep the watermark in the fine-tune targets |
+| `--wall_frac` | 0.0 | `view_gs_web.py` only; near-wall slab, as a fraction of room height |
+| `--percentile` | 2.0 | `view_gs_web.py` only; where the robust room box is drawn |
 | `--wandb` | off | log per-stage scalar metrics to one Weights & Biases run (see below) |
 | `--wandb_project` | `ri3d` | wandb project; `--wandb_entity`, `--wandb_run_name` also available |
 | `--wandb_log_every` | 25 | training iterations between logged points; first and last always log |
