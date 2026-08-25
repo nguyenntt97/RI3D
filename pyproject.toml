@@ -44,6 +44,21 @@ dependencies = [
     "clip @ file:///${PROJECT_ROOT}/third_party/CLIP",
 ]
 
+[project.optional-dependencies]
+# `python inference.py --wandb`. Optional because the pipeline is fully usable
+# without it: utils/wandb_utils.py imports wandb lazily and no-ops if it is
+# missing. Install with `uv sync --extra logging`.
+# Floor of 0.19: Settings became a pydantic model there.
+logging = ["wandb>=0.19"]
+
+# `python scripts/view_gs_web.py`. Optional because nothing in the pipeline
+# imports them -- the viewer is a separate entry point, and gsplat (already a
+# hard dependency) does the actual rasterizing. Install with
+# `uv sync --extra viewer`.
+# Floor of 1.0 on viser: `scene.set_up_direction` and `ClientHandle.camera.fov`
+# are both used and predate it, but 0.x moved the gui/scene namespaces around.
+viewer = ["viser>=1.0", "nerfview>=0.1", "matplotlib"]
+
 [project.urls]
 Homepage = "https://people.engr.tamu.edu/nimak/Papers/RI3D/index.html"
 Repository = "https://github.com/avinashpaliwal/RI3D"

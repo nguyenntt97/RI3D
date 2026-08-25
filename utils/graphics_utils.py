@@ -120,3 +120,28 @@ def z_score_from_percentage(percentage):
     z_score = stats.norm.ppf(1 - proportion)
 
     return z_score
+
+
+def scene_clearance(centers: np.ndarray, points: np.ndarray,
+                    max_points: int = 200000) -> np.ndarray:
+    """Distance from each camera centre to the nearest reconstructed point.
+
+    A proxy for "how far is the closest wall". The orbit is fitted from camera
+    positions alone, so nothing otherwise stops it passing through geometry; this
+    is the measurement that makes the violation checkable.
+
+    The cloud is subsampled because the query side is tiny (120 poses) and the
+    cloud is not -- sceneC's `points.ply` carries 975k points, and a stride over
+    it changes the nearest-neighbour distance by far less than the clearance
+    margins we act on.
+    """
+    from scipy.spatial import cKDTree
+
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    finite = pts[np.isfinite(pts).all(axis=1)]
+    if len(finite) == 0:
+        return np.full(len(centers), np.inf)
+    if len(finite) > max_points:
+        finite = finite[:: int(np.ceil(len(finite) / max_points))]
+    dist, _ = cKDTree(finite).query(np.asarray(centers, dtype=np.float64), k=1)
+    return dist

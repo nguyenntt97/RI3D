@@ -35,15 +35,25 @@ class InPaint():
         self.generator = torch.Generator(device="cuda").manual_seed(1234)
 
     
-    def inpaint(self, image, mask_image, prompt="a photo of xxy5syt00", strength=1.0):
+    DEFAULT_NEGATIVE = "blur, lowres, bad anatomy, bad hands, cropped, worst quality"
+
+    def inpaint(self, image, mask_image, prompt="a photo of xxy5syt00", strength=1.0,
+                num_inference_steps=200, guidance_scale=1, negative_prompt=None):
 
         print("Inpainting prompt...", prompt)
         # image = Image.open(image)
         # mask_image = Image.open(mask)
 
+        # `prompt` goes in as a list, so the negative has to be a list too --
+        # diffusers type-checks the pair. It only slipped through before because
+        # guidance_scale=1 disables classifier-free guidance entirely, so the
+        # negative prompt was never encoded. Anything above 1 hit a TypeError.
+        negative = self.DEFAULT_NEGATIVE if negative_prompt is None else negative_prompt
+
         results = self.pipe(
-            [prompt], image=image, mask_image=mask_image, negative_prompt = "blur, lowres, bad anatomy, bad hands, cropped, worst quality",
-            num_inference_steps=200, guidance_scale=1, generator=self.generator, strength=strength, 
+            [prompt], image=image, mask_image=mask_image, negative_prompt=[negative],
+            num_inference_steps=num_inference_steps, guidance_scale=guidance_scale,
+            generator=self.generator, strength=strength,
         ).images
 
         # result = Image.composite(results[0], image, mask_image)

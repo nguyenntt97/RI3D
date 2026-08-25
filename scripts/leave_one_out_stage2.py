@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import uuid
 from argparse import ArgumentParser, Namespace
-from utils.arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.arguments import ModelParams, PipelineParams, OptimizationParams, apply_loo_iterations
 from random import randint
 import json
 
@@ -18,6 +18,7 @@ from torchmetrics.functional.regression import pearson_corrcoef
 from utils.general_utils import safe_state
 from utils.loss_utils import l1_loss, ssim, monodisp, masked_l1_loss, masked_ssim
 from utils.image_utils import psnr
+from utils import wandb_utils as wb
 from gaussian_renderer import render
 from scene import Scene, GaussianModel
 
@@ -51,6 +52,11 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
     iter_end = torch.cuda.Event(enable_timing = True)
 
     num_id, image_id = train_id
+    # One model per left-out view, each with its own iteration axis: wandb
+    # cannot split a line plot by a logged column, so the view has to live
+    # in the metric name to get one curve per view.
+    pfx = f"stage_2b/leave_{image_id}"
+    wb.define_axis(pfx, "iter")
     viewpoint_stack = None
 
     ema_loss_for_log = 0.0
@@ -88,7 +94,7 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
-        loss, Ll1 = cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg)
+        loss, Ll1, terms = cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg)
 
         loss.backward()
 
@@ -104,8 +110,17 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            elapsed_ms = iter_start.elapsed_time(iter_end)
+            if wb.due(iteration, opt.iterations):
+                wb.log({f"{pfx}/iter": iteration,
+                        f"{pfx}/loss": loss,
+                        f"{pfx}/ema_loss": ema_loss_for_log,
+                        f"{pfx}/num_gauss": num_gauss,
+                        f"{pfx}/iter_ms": elapsed_ms,
+                        **{f"{pfx}/{k}": v for k, v in terms.items()}})
+
             # Log
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render, (pipe, background))
 
             # Save
             if (iteration in saving_iterations):
@@ -151,6 +166,13 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
         mean_diff = torch.mean(diff, dim=0).cpu().numpy()
         std_diff = torch.std(diff, dim=0).cpu().numpy()
         diffs[key] = [mean_diff, std_diff]
+        # These drive the noise distribution stage 5 samples from; the reduced
+        # magnitudes are enough to spot a view whose parameters barely moved.
+        wb.log_summary({f"{pfx}/diff_{key}_absmean": abs(mean_diff).mean(),
+                        f"{pfx}/diff_{key}_std_mean": std_diff.mean()})
+
+    wb.log_summary({f"{pfx}/final_loss": ema_loss_for_log,
+                    f"{pfx}/final_num_gauss": len(gaussians._xyz)})
 
     import pickle
     with open(os.path.join(args.model_path, 'diffs.pkl'), 'wb') as f:
@@ -229,7 +251,14 @@ def cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, silhouette_loss_ty
     # are not learned as scene content. See scene/dataset_readers_flow.py.
     loss_mask = getattr(viewpoint_cam, "loss_mask", None)
     Ll1 = masked_l1_loss(image, gt_image, loss_mask)
-    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - masked_ssim(image, gt_image, loss_mask))
+    Lssim = 1.0 - masked_ssim(image, gt_image, loss_mask)
+    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim
+    # Scalar components for the metric logger. mask_weight makes a zero L1
+    # attributable: masked_l1_loss returns a hard zero when the mask's total
+    # weight drops below 1, which otherwise reads as perfect convergence.
+    terms = {"l1": Ll1, "ssim_loss": Lssim}
+    if loss_mask is not None:
+        terms["mask_weight"] = loss_mask.mean()
 
     # if hasattr(args, "use_mask") and args.use_mask:
     #     if silhouette_loss_type == "bce":
@@ -257,8 +286,9 @@ def cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, silhouette_loss_ty
             raise NotImplementedError
 
         loss = loss + args.mono_depth_weight * depth_loss
+        terms["depth_loss"] = depth_loss
 
-    return loss, Ll1
+    return loss, Ll1, terms
 
 def train_3dgs(args, ids):
     print("Optimizing " + args.model_path)
@@ -269,11 +299,19 @@ def train_3dgs(args, ids):
     dataset = lp.extract(args)
     pipeline = pp.extract(args)
     model_path_root = args.model_path
+    wb.attach()
 
     for num_id, image_id in zip(range(args.sparse_view_num), ids): # num_id: leave one out id, image_id: the id of the image to be infered
         args.model_path = os.path.join(model_path_root, f'leave_{image_id}')
         dataset.model_path = args.model_path
-        args.start_checkpoint = os.path.join(args.model_path, 'chkpnt6000.pth') # load this ckpt
+        # Derived rather than hardcoded to 6000: stage 2a checkpoints at
+        # 0.6 * its iteration count, which --loo_iterations moves.
+        args.start_checkpoint = os.path.join(args.model_path, f'chkpnt{args.loo_boundary}.pth')
+        if not os.path.exists(args.start_checkpoint):
+            print(f"[x] {args.start_checkpoint} not found. Stage 2b resumes from the checkpoint "
+                  f"2a writes at 0.6 * loo_iterations, so --loo_iterations must match the value "
+                  f"2a ran with.")
+            sys.exit(1)
         # os.makedirs(args.model_path, exist_ok=True)
         leave_one_out_training(args,
                     dataset,
@@ -311,8 +349,22 @@ if __name__ == "__main__":
     parser.add_argument("--init_pcd_name", default='origin', type=str, help="the init pcd name. 'random' for random, 'origin' for pcd from the whole scene")
     parser.add_argument('--mono_depth_weight', type=float, default=0.005, help="The rate of monodepth loss")
     parser.add_argument('--ply_path', type=str, help="path to the ply file")
+    parser.add_argument('--loo_iterations', type=int, default=None,
+                        help="Must match the value stage 2a ran with: this stage resumes from the "
+                             "checkpoint 2a wrote at 0.6 * loo_iterations, and looks for it by name.")
 
     args = parser.parse_args(sys.argv[1:])
+    # Stage 2a checkpoints at this iteration; we resume from it. Note that
+    # checkpoint_iterations defaults to [] here -- 2b writes no new checkpoint --
+    # so apply_loo_iterations' value for it is unused, which is why the resume
+    # filename is built from the returned boundary rather than from that list.
+    if args.loo_iterations:
+        args.loo_boundary = apply_loo_iterations(args, args.loo_iterations)
+        args.checkpoint_iterations = []
+        print(f"[i] leave-one-out pass 2: {args.iterations} iterations, resuming from "
+              f"chkpnt{args.loo_boundary}.pth")
+    else:
+        args.loo_boundary = args.densify_until_iter
     args.save_iterations.append(args.iterations)
 
     args.is_renderrr = False
@@ -329,6 +381,8 @@ if __name__ == "__main__":
         data = json.load(json_data)
         ids = data['train_ids']
     train_3dgs(args, ids)
+
+    wb.finish()
 
     # All done
     print("\nAll training complete.")

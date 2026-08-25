@@ -14,7 +14,8 @@ The pipeline falls into three phases: build geometry (0–1), build the priors (
 against them (5).
 
 Depth-prior details, coordinate conventions and a set of related defects are documented separately
-in [`point_map.md`](point_map.md).
+in [`point_map.md`](point_map.md); isometric dollhouse rendering of an indoor result, in
+[`dollhouse.md`](dollhouse.md).
 
 ---
 
@@ -27,14 +28,17 @@ in [`point_map.md`](point_map.md).
 | `wm` | `tools/detect_watermark.py` (opt-in) | `<out>/watermark_mask.png` |
 | `sfm` | `scripts/run_sfm.py` → `ggpt_sfm/run_ggpt.py` or `mast3r/run_mast3r.py` | `<out>/${BACKEND}_sfm/` |
 | — | `inference.py` (depth prep) | `<scene>/depth_rel/`, `depths$N.npy`, `confs$N.npy` |
+| `wmi` | `tools/inpaint_watermark.py` (opt-in) | `<out>/${BACKEND}_sfm/images_wmclean/` |
 | `1a` | `scripts/train_gs_init.py` | `debug/gs_init/${SCENE}_${N}` |
 | `1b` | `scripts/train_gs.py` | `output/gs_init/${SCENE}_${N}` |
 | `2a` `2b` | `scripts/leave_one_out_stage{1,2}.py` | `output/gs_init/${SCENE}_loo_${N}` |
+| `1c` | `tools/gsfix_export.py` → GSFix3D → `scripts/refine_gs_gsfix.py` (opt-in) | `output/gs_gsfix/${SCENE}_${N}` |
 | `3` | `scripts/train_lora.py` | `output/controlnet_finetune/${SCENE}_${N}` |
 | `4` | `train_realfill.py` (external) | `inpainting/${SCENE}_${N}` |
 | `5a` | `scripts/train_repair.py` + `configs/gaussian-object.yaml` | `output_den${N}/gaussian_object/${SCENE}_${N}` |
 | `5b` | `scripts/train_repair.py` + `configs/gaussian-object_inp.yaml` | `output_inp${N}/gaussian_object/${SCENE}_${N}` |
 | `render` | `scripts/render.py` | orbit video + exported PLY |
+| `view` | `scripts/view_gs_web.py` (not a stage) | browser viewer / isometric PNGs |
 
 ---
 
@@ -81,6 +85,54 @@ views. GGPT backend only; `--sfm_backend mast3r` with a mask is an error rather 
 > it did not rescue this scene. sceneB's actual constraint is view count: at 9 views instead of 3
 > the same scene yields **596,294** DLT tracks against 14,333, with epipolar discard falling to
 > 48.8%. Reach for more views before reaching for this stage.
+
+### Stage `wmi` · Watermark inpainting (opt-in)
+
+`wm` stops the watermark being *learned*; `wmi` gives the pipeline something to learn there instead.
+
+Masking makes those pixels unsupervised, which means nothing constrains the Gaussians behind the
+overlay — 11.4% of every sceneC frame — and novel views render garbage in exactly that footprint.
+`wmi` replaces the overlay with plausible content using the SD2-inpainting checkpoint the project
+already ships for stage 4, writing a parallel image set:
+
+```bash
+python inference.py -i examples/sceneC -o output/sceneC --sfm_config unposed -n 6 \
+    --stages wm,sfm,wmi,1,2a --wm_loss_weight 0.2
+```
+
+Output is `<sfm_dir>/images_wmclean/<stem>.png`, which
+`utils/watermark_utils.py:resolve_image_path` swaps in inside `readMipTransforms`. Every consumer
+that goes through that reader — stages 1a, 1b, 2a, 2b, the stage-3 LoRA dataset, the stage-5 data
+module — therefore picks the cleaned frames up with no further plumbing. The stem is preserved, so
+`depth_rel/` and `train_test_split_*.json` lookups are unaffected. It runs **before** depth prep so
+`--depth_source align` feeds Depth-Anything a clean frame too. PNG output keeps the ~88% the mask
+never touches bit-exact rather than JPEG-re-encoding it.
+
+**`--wm_loss_weight` decides what the inpainted region is worth.** It is no longer a binary
+supervise/ignore mask but a per-pixel weight, applied by both `masked_l1_loss` and `masked_ssim`:
+
+| value | meaning |
+|---|---|
+| `0.0` (default) | ignore the region entirely — the original behaviour, and the **only safe value** while the photographs still carry the watermark |
+| `0.1`–`0.3` | supervise the inpainted content, but let real photographic evidence outweigh invented evidence |
+| `1.0` | trust the inpainting exactly as much as the photograph (not recommended) |
+
+Passing a positive weight without a `images_wmclean/` directory is a hard error rather than a silent
+watermark-supervising run.
+
+> **Look at `images_wmclean/` before training on it.** SD2 removes overlays on textured surfaces
+> (floors, furniture) very cleanly, but on flat featureless surfaces it sometimes invents content
+> rather than continuing the surface — on one sceneC frame it replaced watermark text with different
+> invented text. Every bad fill becomes a training target. Tune and spot-check with:
+> ```bash
+> python utils/watermark_utils.py -s output/sceneC/ggpt_sfm -o /tmp/wmtest -n 6
+> ```
+> `--prompt`, `--guidance`, `--steps` and `--min_side` are the knobs; the tool asserts that nothing
+> outside the mask changed, so a bad fill can only ever affect the masked footprint.
+
+> **The mask is still what the losses are keyed to.** `wmi` changes the pixels; it does not remove
+> the mask. That is deliberate — the mask is the record of which pixels are invented, and is what
+> lets `--wm_loss_weight` discount them.
 
 ### Stage 0 · SfM
 
@@ -164,6 +216,123 @@ elsewhere.
 Note `OptimizationParams.iterations` is **10_000** in this repo (`utils/arguments.py`), lowered from
 upstream 3DGS's 30_000.
 
+### Stage `1c` · GSFix3D repair (opt-in)
+
+Takes the stage-1b model and repairs it with **GSFixer**, a Marigold/SD2 latent diffusion model
+from [GSFix3D](https://gsfix3d.github.io/) trained to turn artifacted 3DGS renders into clean
+images. Three sub-steps, driven from `inference.py`:
+
+1. `tools/gsfix_export.py` renders the 120-frame ellipse orbit off the 1b model and writes the
+   directory layout GSFixer reads, plus fine-tuning pairs built from stage 2a's leave-one-out data.
+2. GSFix3D's own `scripts/gsfixer/train.py` fine-tunes GSFixer on those pairs, then its
+   `scripts/gsfixer/inference.py` repairs every orbit frame. **Neither script is modified** — their
+   `--data_type` switch is only consulted under `--eval`, which this stage never passes.
+3. `scripts/refine_gs_gsfix.py` optimizes the Gaussians against the repaired images: a short
+   densifying burst per view, then joint epochs over the sparse photographs plus every repaired
+   view.
+
+```bash
+# leave-one-out first -- 1c depends on 2a, which is why it is not part of `all`
+python inference.py -i examples/sceneC -o output/sceneC --sfm_config unposed -n 6 --stages 2a
+python inference.py -i examples/sceneC -o output/sceneC --sfm_config unposed -n 6 --stages 1c
+```
+
+Needs `models/gsfixer-base` (`scripts/download_hf_models.py`). Use the **base** checkpoint, not
+`gsfixer-full`: RI3D has no mesh, and full's UNet expects a 12-channel latent against base's 8.
+
+**Re-running 1c.** The fine-tune is by far the longest sub-step (~1.5 h for the default 800
+iterations), and the run directory is deleted before each one, so a plain re-run repeats it even
+when only the repair or lift failed. `--gsfix_reuse_finetune` skips it when
+`output/gsfixer_finetune/<scene>_<n>/checkpoint` already resolves to usable UNet weights, and
+falls back to training with a warning when it does not. This is not `--no_gsfix_finetune`: that
+one abandons the scene's weights and runs the base model zero-shot.
+
+**Disk.** The fine-tune is the most space-hungry step in the pipeline. GSFix3D writes its
+resumable `latest` checkpoint as the 3.5 GB UNet *plus* `trainer.ckpt`, which is Adam's two
+moment tensors for an 865M-parameter model in fp32 — **6.9 GB, twice the weights**. It also keeps
+one 3.5 GB `iter_<n>` copy per validation improvement, and `save_checkpoint` renames the previous
+`latest` to `_old_latest` before writing the new one and only deletes it as its last step, so a
+save briefly needs **~21 GB free**. Running out mid-write leaves a `latest` holding
+`unet/config.json` and no weights.
+
+`inference.py` handles both: it resolves the newest checkpoint that actually contains UNet
+weights (falling back from `latest` to the newest `iter_<n>`), and after assembling the pipeline
+it deletes `trainer.ckpt` and any `_old_*` directories — nothing can read them, since the run
+directory is wiped before every fine-tune, so `--resume_run` is unreachable either way. Steady
+state drops from ~17 GB to ~7 GB per scene.
+
+**Why it is opt-in rather than part of `all`.** It consumes stage 2a's output, so it cannot sit
+between 1b and 2a in the default order. It is also an *alternative* to the stage 3–5 diffusion
+path rather than a complement: 5a branches off stage **1a**, so running both just produces two
+independent refinements and leaves the export to pick a winner. Stage 1c's real consumers are the
+final export and stage 3's `--gs_dir`.
+
+> **The fine-tuning pairs must come from early leave-one-out samples.**
+> `leave_one_out_stage1.py:77-80` swaps its camera pool at iteration 6000: below it the model
+> trains on `N-1` views, but above it the pool becomes `scene.getTrainCameras()` — all `N`,
+> including the very view being rendered into `left_image/`. Degradation therefore shrinks
+> monotonically along the sequence and `sample_10000.png` ≈ `gt.png`. `--gsfix_pairs_window`
+> (default 240 iterations) keeps only the genuinely degraded head, mirroring the `cache_max_iter`
+> guard `utils/dataset_lora.py:GSCacheDataset` applies for stage 3.
+
+> **On a watermarked scene the fine-tune targets are cleaned first.** Leave-one-out masks the
+> watermark out of its *losses* but not out of what it saves: `leave_one_out_stage1.py:152` writes
+> `gt.png` straight from `Camera.original_image`, which by design never has `loss_mask` applied —
+> those pixels are meant to stay unsupervised, not be repainted. Pairing that target against a
+> render would teach GSFixer to *reproduce* the watermark at fixed pixel coordinates, and the lift
+> would bake it into 3D as a view-independent artifact.
+>
+> `utils/watermark_utils.py:clean_watermark` paints it out first, using the SD2 inpainting
+> checkpoint already shipped for stage 4. It works per connected component — a padded square crop
+> around each blob, scaled to SD2's native 512, composited back **inside the mask only** so every
+> other pixel stays bit-identical. Results are cached in `<bundle>/finetune/_gt_clean/`, one pass
+> per photograph rather than one per pair. On sceneC: 8 blobs, ~22 s per photograph.
+>
+> Note `guidance_scale=7.5` rather than `InPaint`'s default of 1. At 1, classifier-free guidance is
+> off entirely, the prompt and negative prompt do nothing, and the model free-runs — measured on
+> sceneC that replaced a logo on a blank ceiling with an invented object instead of more ceiling.
+> (Raising it also required fixing `InPaint.inpaint`, which passed a `str` negative prompt against a
+> `list` prompt; diffusers type-checks the pair, so it had only ever worked because guidance of 1
+> skips encoding the negative.)
+>
+> **The same contamination affects stage 3 and is not yet fixed there** —
+> `utils/dataset_lora.py:214` feeds the raw photograph as the LoRA target, so on a watermarked scene
+> the Repair prior learns the watermark too. `clean_watermark` is written to be reusable there.
+
+> **The orbit is kept clear of walls.** `generate_ellipse_path_from_poses` fits the ellipse from
+> camera *positions* only — a PCA frame and semi-axes at the 90th percentile of the camera spread.
+> Nothing in it knows where geometry is, so indoors it drives cameras through walls: measured on
+> sceneC, **29 of 120 poses sat within 0.02 of a surface** (p0 = 0.0016, scene diagonal 3.17), and
+> for 96/120 the nearest surface was horizontal — walls, not floor. Outlier removal left the numbers
+> unchanged, so this was real reconstructed geometry rather than SfM floaters.
+>
+> `--orbit_min_clearance` binary-searches a global scale on the semi-axes until every pose clears a
+> target. Scaling the whole ellipse rather than nudging individual poses matters: the path is both a
+> video trajectory and a training-view sequence, and per-pose displacement kinks both. Measured
+> smoothness (`max step / median step`) stays at exactly 1.000, because the const-speed resampling
+> regenerates around the scaled ellipse.
+>
+> **The default is `-1` — auto, meaning "come no closer to geometry than the closest real
+> photograph did."** An absolute default cannot work: the SfM gauge is arbitrary per solve (see the
+> MASt3R 0.75–19.8 vs GGPT 0.01–1.36 note above), so a threshold tuned on one scene is meaningless
+> on the next. Deriving it from the capture travels. On sceneC that is 0.0718, reached at scale
+> 0.621: p0 0.0016 → 0.0722, median 0.074 → 0.253, **0/120 violations**. `0` restores the old
+> unconstrained path bit-for-bit; a positive value is an explicit distance in world units.
+>
+> If even the floor scale cannot reach the target the run warns and continues with the tightest
+> path — that is the "focal region is itself inside geometry" case, which shrinking cannot fix.
+>
+> Re-running the export after changing this **deletes `fixed/rgb`**: repairs belong to the poses
+> they were made from, and `refine_gs_gsfix.py` pairs them with render cameras by sorted filename,
+> so a stale set would be silently matched to the wrong viewpoints. Re-run GSFixer inference.
+>
+> `python viz.py -i <out>` reports orbit clearance and colours violating poses red.
+
+> **`--gsfix_anchor_every` guards against drift.** Upstream `refine_gs.py` fits each repaired view
+> for 20 iterations with no ground-truth term — roughly 2400 unanchored steps across the orbit,
+> which can pull the model off the real photographs. The default injects one sparse-photograph step
+> after each repaired view; `--gsfix_anchor_every 0` reproduces upstream exactly.
+
 ---
 
 ## Phase 2 — Scene-specific priors
@@ -179,6 +348,36 @@ for artifact repair, generated from the scene itself.
 giving degradation at two severity levels.
 
 This stage propagates **no point cloud forward** — its product is the set of LOO Gaussian models.
+
+**It is the longest stage in the pipeline**: one full model per sparse view, 10,000 iterations each
+— ~62 minutes for sceneC's 6 views. `--loo_iterations` shortens it.
+
+> ⚠ **Do not shorten it with `--iterations`.** Four values are coupled to the iteration count and
+> only one of them follows, so the stage fails silently — producing *no* `left_image/` samples,
+> which are its entire product:
+>
+> | value | why it does not follow |
+> |---|---|
+> | `densify_until_iter` | Derived in `OptimizationParams.__init__` as `0.6 * iterations`, from the **default** 10,000. Stays 6000 whatever `--iterations` says. Sample capture is gated on `iteration > densify_until_iter`, so a shorter run never captures. |
+> | `checkpoint_iterations` | Defaults to `[6000]` — the checkpoint 2b resumes from. |
+> | 2b's resume filename | Was hardcoded `chkpnt6000.pth`; now derived. |
+> | `position_lr_max_steps` | 30,000, so a short run barely moves down the xyz schedule. |
+>
+> `--loo_iterations` sets all four together (`utils/arguments.py:apply_loo_iterations`) and logs the
+> derived values. Pass the **same value to 2a and 2b** — 2b looks for `chkpnt{0.6 × N}.pth` by name
+> and now fails loudly rather than silently if it is missing.
+
+> ⚠ **A re-run does not replace an existing leave-one-out directory.** `gt.png` is written only when
+> absent (`leave_one_out_stage1.py:156`), so old targets survive — which is how a run predating
+> stage `wmi` leaves *watermarked* ground truth in place while everything else is regenerated.
+> `left_image/` has no such guard, so a re-run at a different iteration count also mixes old and new
+> renders. Stage 2a now refuses to start on a populated directory; delete it or pass `--force_loo`.
+
+Interaction with stage `1c`: `gsfix_export.py --pairs_window` is expressed in *iterations*, and
+capture writes one sample per epoch of `N` cameras. At the default 10,000 with N=6 the 240-iteration
+window keeps ~40 samples per view; at `--loo_iterations 3000` capture spans 1800→3000 and the same
+window keeps roughly the same count. That is a consequence of the fixed 60% split, not a guarantee —
+check `finetune/` pair counts if you change either.
 
 ### Stage 3 · Repair prior (LoRA)
 
@@ -229,6 +428,71 @@ preferring 5b → 5a → the highest-iteration stage-1b checkpoint.
 
 ---
 
+## Viewing an indoor result
+
+`scripts/view_gs_web.py` serves any stage's PLY in a browser through viser + nerfview + gsplat,
+and adds the post-processing an **indoor** scan needs before an isometric view shows anything: a
+room is photographed from inside, so both the ceiling and the near walls sit between an elevated
+camera and the room, and a top-down view renders the underside of a roof.
+
+Both are detected and removed at view time — the ceiling once, the walls per viewing angle, each
+sized to its own reconstructed thickness — so orbiting always looks into the room. A wall the
+detector cannot find is left standing rather than guessed at.
+
+```bash
+uv sync --extra viewer      # viser + nerfview; nothing in the pipeline imports them
+
+# interactive
+python scripts/view_gs_web.py -m output/gs_gsfix/sceneC_6 \
+    -c output/sceneC/ggpt_sfm/cameras.json --port 8080
+
+# headless — before / ceiling cut / full dollhouse, plus four corner views
+python scripts/view_gs_web.py -m output/gs_gsfix/sceneC_6 \
+    -c output/sceneC/ggpt_sfm/cameras.json --screenshot out/iso
+```
+
+`-m` takes a PLY **or** a model directory, in which case the highest `point_cloud/iteration_*`
+wins — iteration counts are not fixed in this repo. Stage `1c` is the intended input, but nothing
+here is stage-specific: 1b, 5a and 5b are all plain 3DGS PLYs. `-c` is optional but wanted: the
+SfM cameras are the only reliable source of the world up axis.
+
+`utils/dollhouse_utils.py` holds the geometry and runs standalone (`-m`, `-c`) to print the height
+histogram and the detected levels without opening a browser.
+
+The controls are all **view-time** filters — nothing is written back to the PLY, so each costs one
+masked index rather than a reload:
+
+| control | flag | default | what it does |
+|---|---|---|---|
+| Ceiling cut | `--cut` | detected | drops everything above a height, found from the opacity-weighted height histogram |
+| Cut near walls | `--no_wall_cut` | on | drops the one or two walls facing the camera, recomputed as you orbit |
+| Wall cut × | `--wall_scale` | 1.0 | multiplier on each wall's *own* detected thickness. 0 disables; 2.0 over-cuts |
+| Room box tightness | `--percentile` | 2.0 | where the robust room box is drawn, which sets both the floater crop and the framing |
+
+`--wall_frac` is retained as a legacy override: one absolute slab thickness, as a fraction of room
+height, applied to all four walls and bypassing detection. It is also the escape hatch for a scene
+where detection declines — an open-plan or outdoor capture, where there are no walls to find.
+
+The projection is really orthographic (gsplat `camera_model="ortho"`), not a long-lens perspective
+fake. `--sh_degree 0` is worth trying: an isometric camera sits far outside the distribution of
+viewing directions the model was supervised on, so the higher SH bands extrapolate into colour
+artefacts.
+
+> ⚠ **Check `prominence` before trusting the cut.** It is the spike's height above the room plateau,
+> reported for the ceiling and for each of the four walls. sceneC's ceiling scores 1.28 and its walls
+> 3.25–11.50; sceneA's ceiling scores **0.09** and is reported `[LOW CONFIDENCE]`, because it has no
+> distinct ceiling plane to find. The ceiling fallback there is a cut at 90% of the height range,
+> which is a framing convenience and **not** a detection — and since a scene with no ceiling is not
+> an enclosed room, all four of its walls are declined too and left standing.
+
+The derivation, the measurements behind every default, and the defects found while building it —
+including why backface culling is unavailable on stage 1c's isotropic Gaussians (twice over: the
+splats carry no orientation, and estimated normals reach only 41% recall on walls), why the wall
+search has to run over the room box rather than a percentile range, and why a generic 3DGS viewer
+reads this repo's spherical harmonics in the wrong order — are in [`dollhouse.md`](dollhouse.md).
+
+---
+
 ## Dependency graph
 
 ```
@@ -246,6 +510,9 @@ Two non-obvious edges:
   initialization therefore propagates into three separate places rather than one.
 - **Stage 1b's trained model is not consumed by 5a.** It feeds stage 3 (via `--gs_dir`) and serves
   as the evaluation baseline.
+- **Stage 1c hangs off 1b and 2a, and feeds nothing downstream.** Because 5a branches off 1a, a
+  GSFix3D-refined 1b does not reach the diffusion stages; its output is the final export (when
+  5a/5b have not run) and stage 3's `--gs_dir`. That is also why it is opt-in.
 
 ### Point cloud through the stages
 
@@ -290,8 +557,9 @@ python inference.py -i /path/to/photos -o output/my_scene \
     --sfm_backend mast3r --sfm_config unposed --stages sfm,1 -n 3
 ```
 
-Selected stages — comma-separated; `1` expands to `1a,1b`, `2` to `2a,2b`, `5` to `5a,5b`. `wm` is
-opt-in and not part of `all`, since most scenes carry no watermark:
+Selected stages — comma-separated; `1` expands to `1a,1b`, `2` to `2a,2b`, `5` to `5a,5b`. `wm`,
+`wmi` and `1c` are opt-in and not part of `all` — most scenes carry no watermark, and `1c` needs
+stage 2a plus an external checkpoint:
 
 ```bash
 python inference.py -i <scene> --stages sfm,1,2,3,5a,5b -n 3
@@ -326,7 +594,7 @@ Use `--stages sfm,1` rather than `--stages 1` for raw photos — `1` alone skips
 | flag | default | notes |
 |---|---|---|
 | `-n / --num_views` | 3 | number of sparse training views |
-| `-r / --resolution` | 4 | downsample factor; must be consistent across all stages |
+| `-r / --resolution` | 4 | **no effect on this path** — see the gotcha below |
 | `--sh_degree` | 2 | spherical-harmonics degree |
 | `--depth_source` | `pointmap` | see [`point_map.md`](point_map.md) §4 |
 | `--sfm_config` | `posed` | `unposed` runs the SfM stage; `posed` requires `--sfm_backend mast3r` |
@@ -336,6 +604,53 @@ Use `--stages sfm,1` rather than `--stages 1` for raw photos — `1` alone skips
 | `--ggpt_refine` | off | GGPT only; additionally run the PTv3 point transformer |
 | `--ggpt_python` | `…/envs/ggpt/bin/python` | GGPT only; interpreter for the out-of-process worker |
 | `--prompt` | `xxy5syt00` | rare token for the Repair LoRA; must match across stages 3 and 5 |
+| `--wm_loss_weight` | 0.0 | weight for inpainted watermark pixels in 1b/2a/2b; needs stage `wmi` |
+| `--loo_iterations` | 10000 | stages 2a/2b; iterations per leave-one-out model. Use this, not `--iterations` |
+| `--force_loo` | off | stage 2a; delete an existing leave-one-out directory instead of refusing |
+| `--orbit_min_clearance` | -1 | minimum orbit distance from geometry. -1 = auto (match the closest real photo), 0 = off, >0 = world units |
+| `--gsfix_root` | `…/projects/GSFix3D` | stage 1c only; path to the GSFix3D checkout |
+| `--gsfix_ckpt` | `models/gsfixer-base` | stage 1c only; must be the 8-channel *base* variant |
+| `--no_gsfix_finetune` | off | stage 1c only; skip scene fine-tuning and run GSFixer zero-shot |
+| `--gsfix_reuse_finetune` | off | stage 1c only; reuse an existing fine-tune instead of retraining it |
+| `--gsfix_pairs_window` | 240 | stage 1c only; leave-one-out iterations kept as fine-tuning pairs |
+| `--gsfix_anchor_every` | 1 | stage 1c only; sparse-photograph steps interleaved into the lift |
+| `--no_watermark_clean` | off | `gsfix_export.py` only; keep the watermark in the fine-tune targets |
+| `--wall_scale` | 1.0 | `view_gs_web.py` only; multiplier on each wall's own detected thickness |
+| `--no_wall_cut` | off | `view_gs_web.py` only; keep the near walls, cut only the ceiling |
+| `--wall_frac` | 0.0 | `view_gs_web.py` only; legacy absolute slab for all four walls |
+| `--percentile` | 2.0 | `view_gs_web.py` only; where the robust room box is drawn |
+| `--wandb` | off | log per-stage scalar metrics to one Weights & Biases run (see below) |
+| `--wandb_project` | `ri3d` | wandb project; `--wandb_entity`, `--wandb_run_name` also available |
+| `--wandb_log_every` | 25 | training iterations between logged points; first and last always log |
+
+### Metrics (`--wandb`)
+
+Off by default. `wandb` is an optional dependency — install it with `uv sync --extra logging`.
+When it is missing or unauthenticated, logging degrades to a warning and the pipeline runs
+unchanged.
+
+Each stage is its own subprocess, so `inference.py` mints one run id and every stage resumes it.
+Metrics are namespaced per stage on their own x-axis, so nothing shares a step counter:
+
+| namespace | axis | what |
+|---|---|---|
+| `stage_wm/*` | — | mask coverage, component count, edge percentiles, residual leak |
+| `stage_wmi/*` | `image_idx` | per-image inpainting time; counts and mask coverage in the summary |
+| `stage_1a/*` | — | init point count and how many the watermark mask killed (no loss: 1a never trains) |
+| `stage_1b/*` | `iter` | `loss`, `l1`, `ssim_loss`, `depth_loss`, `ema_loss`, `num_gauss`, `mask_weight`, plus test/train PSNR at `--test_iterations` |
+| `stage_2a/leave_<id>/*` | `iter` | the same set, once per left-out view |
+| `stage_2b/leave_<id>/*` | `iter` | ditto, on 2b's resumed 6001..10000 axis, plus the parameter-diff statistics |
+| `stage_1c/*` | `step` | `loss_phaseA`, `loss_anchor`, `loss_phaseB`, `num_gauss` |
+| `stage_5a/*`, `stage_5b/*` | `step` | everything the threestudio system already reports |
+| `pipeline/*` | — | wall-clock per stage and for the whole run |
+
+Only scalars are ever logged — no renders, and console capture is off. `mask_weight` is worth
+watching when `--wm_loss_weight` is set: `masked_l1_loss` returns a hard zero if the mask's total
+weight falls below 1, which would otherwise look like perfect convergence.
+
+The stage-1c GSFixer fine-tune is a **separate** run in the same project and group. It is a
+different codebase that initializes wandb with `sync_tensorboard=True`, which takes over the step
+axis; joining the pipeline run would clobber its history.
 
 Required checkpoints live in `models/` (gitignored): SD 1.5, ControlNet Tile v1.1, SD2-inpainting —
 fetch with `python scripts/download_hf_models.py`. SfM weights are separate: MASt3R's are downloaded
@@ -345,6 +660,16 @@ needs `GGPT/ckpts/model.step228000.pth`. `inference.py` warns about anything mis
 ---
 
 ## Gotchas
+
+**`-r / --resolution` does nothing on the `transforms.json` path.** It reads as a downsample factor
+and the docs long described it as one, but `readMipTransforms`
+(`scene/dataset_readers_flow.py:126`) stores `width = resolution * width`, and `loadCam`
+(`utils/camera_utils.py:53`) then divides by `args.resolution` — the two cancel for *every* value.
+Measured on sceneC, `-r 1`, `-r 2`, `-r 4` and `-r 8` all yield 1024×768 training and render
+cameras; the depth back-projection in `dataset_readers_flow.py:407-415` divides it back out the
+same way. Every stage has therefore always run at native resolution, and passing a different `-r`
+between stages is harmless rather than the consistency hazard it looks like. Do not reach for `-r`
+to control memory or speed — it will not.
 
 **Re-running SfM invalidates the depth prior.** Either backend's world gauge is arbitrary and a
 re-solve can return a different rotation, translation *and scale*. A re-solve may also drop views

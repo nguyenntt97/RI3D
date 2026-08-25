@@ -19,7 +19,7 @@ from torch.multiprocessing import Pool
 import cv2
 from typing import NamedTuple, Optional, List, Tuple
 from scipy.special import softmax
-from utils.graphics_utils import getWorld2View2
+from utils.graphics_utils import getWorld2View2, scene_clearance
 
 WARNED = False
 
@@ -84,15 +84,25 @@ def loadCam(args,
     # else:
     loaded_mask = None
 
-    # Photometric-loss mask, resized to the training resolution. Nearest, and the
-    # threshold biases toward *ignoring*: a pixel only counts as supervised if it
-    # is fully outside the mask, so resampling never reintroduces watermark pixels.
+    # Photometric-loss weight, resized to the training resolution. Nearest, and the
+    # threshold biases toward *distrusting*: a pixel only counts as fully
+    # supervised if it is fully outside the mask, so resampling never smuggles
+    # masked pixels back in at full weight.
+    #
+    # `wm_loss_weight` sets what the masked region is worth. 0 (the default)
+    # reproduces the original behaviour of ignoring it entirely, which is the only
+    # safe value while the photographs still contain the watermark. Once stage
+    # `wmi` has replaced it with inpainted content, a small positive weight lets
+    # that region constrain the Gaussians -- it is plausible rather than
+    # photographic, so it should pull less hard than real evidence.
     loss_mask = None
     if cam_info.loss_mask is not None:
         lm = cv2.resize(
             cam_info.loss_mask.astype(np.float32), resolution, interpolation=cv2.INTER_AREA
         )
-        loss_mask = torch.from_numpy((lm >= 0.999).astype(np.float32)).unsqueeze(0)
+        clean = (lm >= 0.999).astype(np.float32)
+        w = float(getattr(args, "wm_loss_weight", 0.0))
+        loss_mask = torch.from_numpy(clean + (1.0 - clean) * w).unsqueeze(0)
 
     mono_depth = cam_info.mono_depth
     ### we load depth here for acceleration
@@ -360,8 +370,18 @@ def generate_ellipse_path_from_poses(poses: np.ndarray,
                           n_frames: int = 120,
                           const_speed: bool = True,
                           z_variation: float = 0.,
-                          z_phase: float = 0.) -> np.ndarray:
-    """Generate an elliptical render path based on the given poses."""
+                          z_phase: float = 0.,
+                          ellipse_scale: float = 1.0) -> np.ndarray:
+    """Generate an elliptical render path based on the given poses.
+
+    `ellipse_scale` shrinks the ellipse about its focal point. 1.0 is the
+    unconstrained path; generate_ellipse_path_from_camera_infos searches this
+    value to keep the path clear of scene geometry. Scaling the semi-axes rather
+    than displacing individual poses keeps the result a true ellipse, so the
+    const-speed resampling and look-at construction below stay consistent and the
+    path stays smooth -- it is both a video trajectory and a training-view
+    sequence, and kinks hurt each.
+    """
     # Calculate the focal point for the path (cameras point toward this).
     center = focus_point_fn(poses)# + [0, 0, 2*np.mean(np.abs(poses[:, 2, 3]))]
     # Path height sits at z=0 (in middle of zero-mean capture pattern).
@@ -371,13 +391,16 @@ def generate_ellipse_path_from_poses(poses: np.ndarray,
     # exit()
 
     # Calculate scaling for ellipse axes based on input camera positions.
-    sc = np.percentile(np.abs(poses[:, :3, 3] - offset), 90, axis=0)
+    sc = np.percentile(np.abs(poses[:, :3, 3] - offset), 90, axis=0) * ellipse_scale
     # Use ellipse that is symmetric about the focal point in xy.
     low = -sc + offset
     high = sc + offset
-    # Optional height variation need not be symmetric
-    z_low = np.percentile((poses[:, :3, 3]), 10, axis=0)
-    z_high = np.percentile((poses[:, :3, 3]), 90, axis=0)
+    # Optional height variation need not be symmetric. Shrunk about the focal
+    # point too, so a scaled path contracts uniformly rather than keeping its
+    # full vertical swing over a narrowed footprint.
+    z_mid = np.percentile((poses[:, :3, 3]), 50, axis=0)
+    z_low = z_mid + (np.percentile((poses[:, :3, 3]), 10, axis=0) - z_mid) * ellipse_scale
+    z_high = z_mid + (np.percentile((poses[:, :3, 3]), 90, axis=0) - z_mid) * ellipse_scale
 
     def get_positions(theta):
         # Interpolate between bounds with trig functions to get ellipse in x-y.
@@ -597,15 +620,75 @@ def generate_ellipse_path_from_camera_infos(
         n_frames: int = 120,
         const_speed: bool = True,
         z_variation: float = 0.,
-        z_phase: float = 0.
+        z_phase: float = 0.,
+        clearance_points: Optional[np.ndarray] = None,
+        min_clearance: float = 0.0,
+        min_scale: float = 0.15,
     ) -> List[CameraInfo]:
+    """Build the orbit, optionally shrinking it until it clears scene geometry.
+
+    `min_clearance` semantics:
+      < 0   auto -- the closest any *real* photograph got to geometry. The SfM
+            gauge is arbitrary per solve (docs/pipeline.md: MASt3R spans
+            0.75-19.8 where GGPT spans 0.01-1.36 on one scene), so an absolute
+            default would be meaningless across scenes; deriving it from the
+            capture itself travels.
+      = 0   disabled, the historical path.
+      > 0   an explicit distance in world units.
+    """
     print(f'Generating ellipse path from {len(cam_infos)} camera infos ...')
     poses = np.array([np.linalg.inv(getWorld2View2(cam_info.R, cam_info.T))[:3, :4] for cam_info in cam_infos])
     poses[:, :, 1:3] *= -1
     poses, transform, scale_factor = transform_poses_pca(poses)
-    render_poses = generate_ellipse_path_from_poses(poses, n_frames, const_speed, z_variation, z_phase)
+
+    def _build(scale):
+        rp = generate_ellipse_path_from_poses(
+            poses, n_frames, const_speed, z_variation, z_phase, ellipse_scale=scale)
+        # The generator works in the PCA frame; the point cloud is in world
+        # space, so clearance can only be measured after inverting back.
+        return invert_transform_poses_pca(rp, transform, scale_factor)
+
+    render_poses = _build(1.0)
     print(f'Generated {len(render_poses)} render poses ...')
-    render_poses = invert_transform_poses_pca(render_poses, transform, scale_factor)
+
+    if clearance_points is not None and min_clearance != 0.0:
+        cam_centers = np.array([np.linalg.inv(getWorld2View2(c.R, c.T))[:3, 3] for c in cam_infos])
+        target = min_clearance
+        if target < 0:
+            train_clear = scene_clearance(cam_centers, clearance_points)
+            target = float(np.min(train_clear))
+            print(f'[orbit] auto clearance target {target:.4f} '
+                  f'(closest of {len(cam_centers)} training cameras)')
+
+        before = scene_clearance(render_poses[:, :3, 3], clearance_points)
+        if before.min() >= target:
+            print(f'[orbit] clearance min={before.min():.4f} already >= {target:.4f}; not shrinking')
+        else:
+            # Largest scale that clears the target. Monotone enough in practice
+            # for bisection, and only ~12 cheap ellipse rebuilds either way.
+            lo, hi = min_scale, 1.0
+            best = None
+            for _ in range(12):
+                mid = 0.5 * (lo + hi)
+                cand = _build(mid)
+                if scene_clearance(cand[:, :3, 3], clearance_points).min() >= target:
+                    best, lo = (mid, cand), mid
+                else:
+                    hi = mid
+            if best is None:
+                cand = _build(min_scale)
+                after = scene_clearance(cand[:, :3, 3], clearance_points)
+                print(f'[orbit] !! even scale {min_scale} only reaches {after.min():.4f} < {target:.4f}. '
+                      f'The focal region is itself inside geometry, which shrinking cannot fix -- '
+                      f'using the tightest path and continuing.')
+                render_poses = cand
+            else:
+                scale, render_poses = best
+                after = scene_clearance(render_poses[:, :3, 3], clearance_points)
+                print(f'[orbit] shrunk to scale {scale:.3f} for >= {target:.4f} clearance: '
+                      f'min {before.min():.4f} -> {after.min():.4f}, '
+                      f'p10 {np.percentile(before,10):.4f} -> {np.percentile(after,10):.4f}, '
+                      f'median {np.median(before):.4f} -> {np.median(after):.4f}')
     path_center = (render_poses[0, :, 3] + render_poses[len(render_poses) // 2, :, 3]) / 2
     # print(render_poses[0, :, 3] - path_center, render_poses[len(render_poses) // 2, :, 3] - path_center, path_center, np.linalg.norm(render_poses[0, :, 3] - path_center), np.linalg.norm(render_poses[len(render_poses) // 2, :, 3] - path_center))
     # lengths = [np.linalg.norm(pose[:3, 3] - path_center) for pose in render_poses]

@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import uuid
 from argparse import ArgumentParser, Namespace
-from utils.arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.arguments import ModelParams, PipelineParams, OptimizationParams, apply_loo_iterations
 from random import randint
 import json
 
@@ -18,6 +18,7 @@ from torchmetrics.functional.regression import pearson_corrcoef
 from utils.general_utils import safe_state
 from utils.loss_utils import l1_loss, ssim, monodisp, masked_l1_loss, masked_ssim
 from utils.image_utils import psnr
+from utils import wandb_utils as wb
 from gaussian_renderer import render
 from scene import Scene, GaussianModel
 
@@ -48,6 +49,11 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
     iter_end = torch.cuda.Event(enable_timing = True)
 
     num_id, image_id = train_id
+    # One model per left-out view, each with its own iteration axis: wandb
+    # cannot split a line plot by a logged column, so the view has to live
+    # in the metric name to get one curve per view.
+    pfx = f"stage_2a/leave_{image_id}"
+    wb.define_axis(pfx, "iter")
     viewpoint_stack = None
 
     ema_loss_for_log = 0.0
@@ -92,7 +98,7 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
-        loss, Ll1 = cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg)
+        loss, Ll1, terms = cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg)
 
         loss.backward()
 
@@ -108,8 +114,17 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            elapsed_ms = iter_start.elapsed_time(iter_end)
+            if wb.due(iteration, opt.iterations):
+                wb.log({f"{pfx}/iter": iteration,
+                        f"{pfx}/loss": loss,
+                        f"{pfx}/ema_loss": ema_loss_for_log,
+                        f"{pfx}/num_gauss": num_gauss,
+                        f"{pfx}/iter_ms": elapsed_ms,
+                        **{f"{pfx}/{k}": v for k, v in terms.items()}})
+
             # Log
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render, (pipe, background))
 
             # Save
             if (iteration in saving_iterations):
@@ -155,6 +170,9 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
                 torchvision.utils.save_image(rendering, os.path.join(render_path, f'sample_{iteration}.png'))
                 if not os.path.exists(os.path.join(args.model_path, 'gt.png')):
                     torchvision.utils.save_image(gt, os.path.join(args.model_path, 'gt.png'))
+
+    wb.log_summary({f"{pfx}/final_loss": ema_loss_for_log,
+                    f"{pfx}/final_num_gauss": len(gaussians._xyz)})
 
     ### in the end, we need store the gaussians.cache for latter use
     torch.save(gaussians.cache, os.path.join(args.model_path, 'gaussians_cache.pth'))
@@ -231,7 +249,14 @@ def cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, silhouette_loss_ty
     # are not learned as scene content. See scene/dataset_readers_flow.py.
     loss_mask = getattr(viewpoint_cam, "loss_mask", None)
     Ll1 = masked_l1_loss(image, gt_image, loss_mask)
-    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - masked_ssim(image, gt_image, loss_mask))
+    Lssim = 1.0 - masked_ssim(image, gt_image, loss_mask)
+    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim
+    # Scalar components for the metric logger. mask_weight makes a zero L1
+    # attributable: masked_l1_loss returns a hard zero when the mask's total
+    # weight drops below 1, which otherwise reads as perfect convergence.
+    terms = {"l1": Ll1, "ssim_loss": Lssim}
+    if loss_mask is not None:
+        terms["mask_weight"] = loss_mask.mean()
 
     # if hasattr(args, "use_mask") and args.use_mask:
     #     if silhouette_loss_type == "bce":
@@ -259,8 +284,9 @@ def cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, silhouette_loss_ty
             raise NotImplementedError
 
         loss = loss + args.mono_depth_weight * depth_loss
+        terms["depth_loss"] = depth_loss
 
-    return loss, Ll1
+    return loss, Ll1, terms
 
 def train_3dgs(args, ids):
     print("Optimizing " + args.model_path)
@@ -271,7 +297,8 @@ def train_3dgs(args, ids):
     dataset = lp.extract(args)
     pipeline = pp.extract(args)
     model_path_root = args.model_path
-    
+    wb.attach()
+
     for num_id, image_id in zip(range(args.sparse_view_num), ids): # num_id: leave one out id, image_id: the id of the image to be infered
         args.model_path = os.path.join(model_path_root, f'leave_{image_id}')
         dataset.model_path = args.model_path
@@ -312,10 +339,26 @@ if __name__ == "__main__":
     parser.add_argument("--init_pcd_name", default='origin', type=str, help="the init pcd name. 'random' for random, 'origin' for pcd from the whole scene")
     parser.add_argument('--mono_depth_weight', type=float, default=0.005, help="The rate of monodepth loss")
     parser.add_argument('--ply_path', type=str, help="path to the ply file")
+    parser.add_argument('--loo_iterations', type=int, default=None,
+                        help="Shorten each leave-one-out model to this many iterations. This is the "
+                             "long pole of the pipeline -- one full model per sparse view, 10_000 "
+                             "iterations each by default. Prefer this over --iterations: it also "
+                             "rescales densify_until_iter, the checkpoint iteration and "
+                             "position_lr_max_steps, which are coupled to it and do not follow "
+                             "--iterations on their own (see utils/arguments.py:apply_loo_iterations).")
 
     args = parser.parse_args(sys.argv[1:])
+    # Boundary between the leave-one-out phase and the capture phase: below it the
+    # model trains on N-1 views, above it samples are written to left_image/ and a
+    # checkpoint is dropped for stage 2b.
+    if args.loo_iterations:
+        args.loo_boundary = apply_loo_iterations(args, args.loo_iterations)
+        print(f"[i] leave-one-out: {args.iterations} iterations, capture and checkpoint at "
+              f"{args.loo_boundary}, xyz schedule over {args.position_lr_max_steps} steps")
+    else:
+        args.loo_boundary = args.densify_until_iter
     args.save_iterations.append(args.iterations)
-    
+
     args.is_renderrr = False
     args.scaling_lr = 0
     print(args)
@@ -336,6 +379,8 @@ if __name__ == "__main__":
         ids = data['train_ids']
 
     train_3dgs(args, ids)
+
+    wb.finish()
 
     # All done
     print("\nAll training complete.")

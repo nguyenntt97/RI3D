@@ -53,6 +53,7 @@ zip_output/
 *.tar.gz
 *.tar
 *.gz
+output/
 
 # Model Weights (downloaded via scripts/download_hf_models.py)
 models/*

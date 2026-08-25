@@ -95,6 +95,8 @@ class LooDataModuleConfig:
     around_gt_steps: int = 750
     refresh_interval: int = 100
     refresh_size: int = 20
+    # See ModelParams.orbit_min_clearance: <0 auto, 0 disabled, >0 world units.
+    orbit_min_clearance: float = -1.0
 
 
 
@@ -212,7 +214,21 @@ class LooDataset(Dataset):
         cam_infos_unsorted = readMipTransforms(self.data_dir, resolution=cfg.resolution)
         # reading_dir = "images" if images == None else images
         cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
-        self.render_cam_infos = generate_ellipse_path_from_camera_infos(cam_infos)#[::-1]
+        # Keep stage 5's novel views out of walls too -- same constraint the
+        # scene reader applies, same fused SfM cloud.
+        _orbit_pts = None
+        if self.cfg.orbit_min_clearance != 0.0:
+            _p = os.path.join(self.data_dir, "points.ply")
+            if os.path.exists(_p):
+                try:
+                    from plyfile import PlyData
+                    _v = PlyData.read(_p)["vertex"]
+                    _orbit_pts = np.vstack([_v["x"], _v["y"], _v["z"]]).T
+                except Exception as e:
+                    print(f"[!] Could not read {_p} for orbit clearance: {e}")
+        self.render_cam_infos = generate_ellipse_path_from_camera_infos(
+            cam_infos, clearance_points=_orbit_pts,
+            min_clearance=self.cfg.orbit_min_clearance)#[::-1]
 
         
         self.fov_scale = 1.1

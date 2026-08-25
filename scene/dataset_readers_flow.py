@@ -32,6 +32,7 @@ from scene.gaussian_model import BasicPointCloud
 from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2, transform_pcd
 from utils.image_utils import load_meshlab_file
 from utils.camera_utils import transform_cams, CameraInfo, generate_ellipse_path_from_camera_infos
+from utils.watermark_utils import resolve_image_path
 
 from utils.bilateral_filtering import sparse_bilateral_filtering
 
@@ -117,7 +118,10 @@ def readMipTransforms(path, resolution=4):
         FovY = focal2fov(focal_length_y, height)
         FovX = focal2fov(focal_length_x, width)
 
-        image_path = osp.join(path, impath)
+        # Swaps in <sfm_dir>/images_wmclean/<stem>.png when stage `wmi` has run.
+        # The stem is preserved, so depth_rel and the train/test split still key
+        # off the same name.
+        image_path = resolve_image_path(osp.join(path, impath))
         image_name = osp.basename(image_path).split(".")[0]
         image = None#Image.open(image_path)
 
@@ -278,7 +282,26 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, extra_opts=None, ply_ini
     test_cam_infos = [cam_infos[i] for i in test_ids]
     # print(train_cam_infos)
 
-    render_cam_infos = generate_ellipse_path_from_camera_infos(cam_infos)
+    # The orbit is fitted from camera positions alone, so nothing stops it
+    # passing through walls. Hand it the fused SfM cloud so it can shrink until
+    # it clears geometry. Read here rather than reusing the load further down --
+    # that one happens ~200 lines later, after the path is already built.
+    orbit_points = None
+    orbit_clearance = getattr(extra_opts, "orbit_min_clearance", 0.0) if extra_opts else 0.0
+    if orbit_clearance != 0.0:
+        for cand in (osp.join(path, "points.ply"), osp.join(path, "sparse", "0", "points3D.ply")):
+            if osp.exists(cand):
+                try:
+                    _pcd = fetchPly(cand)
+                    orbit_points = np.asarray(_pcd.points)
+                    break
+                except Exception as e:
+                    print(f"[!] Could not read {cand} for orbit clearance: {e}")
+        if orbit_points is None:
+            print(f"[!] No point cloud under {path} for orbit clearance; leaving the path unconstrained.")
+
+    render_cam_infos = generate_ellipse_path_from_camera_infos(
+        cam_infos, clearance_points=orbit_points, min_clearance=orbit_clearance)
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -380,7 +403,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, extra_opts=None, ply_ini
 
     watermark_mask = _find_watermark_mask(train_cam_infos[0]) if train_cam_infos else None
     if watermark_mask is not None:
-        print(f"[i] Watermark loss mask: ignoring {(1 - watermark_mask).mean() * 100:.2f}% "
+        covered = (1 - watermark_mask).mean() * 100
+        w = float(getattr(extra_opts, "wm_loss_weight", 0.0))
+        how = "ignoring" if w <= 0 else f"weighting at {w:g}"
+        print(f"[i] Watermark loss mask: {how} {covered:.2f}% "
               "of every training pixel (photometric losses only).")
 
     for idx, cam_info in enumerate(train_cam_infos):
