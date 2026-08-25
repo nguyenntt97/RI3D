@@ -2,8 +2,10 @@
 
 An indoor scene is photographed from *inside*. Every Gaussian that lands on the ceiling therefore
 sits between an elevated camera and the room, and any top-down or isometric view renders the
-underside of a roof. `scripts/view_gs_web.py` serves a model in a browser and removes that
-occluder at view time; `utils/dollhouse_utils.py` holds the geometry and runs standalone.
+underside of a roof — and once the roof is off, the near walls do the same thing, since they too are
+reconstructed on their inside faces. `scripts/view_gs_web.py` serves a model in a browser and
+removes both occluders at view time, the ceiling once and the walls per viewing angle;
+`utils/dollhouse_utils.py` holds the geometry and runs standalone.
 
 This document records how the cut is derived, what was measured on the way, and the defects found
 while building it. The user-facing summary is in [`pipeline.md`](pipeline.md) under
@@ -20,7 +22,7 @@ output is format-identical, so numbers carry over.
 | | |
 |---|---|
 | `scripts/view_gs_web.py` | browser viewer (viser + nerfview + gsplat) and headless PNG mode |
-| `utils/dollhouse_utils.py` | up axis, room frame, ceiling detection, cut, isometric camera |
+| `utils/dollhouse_utils.py` | up axis, room frame, ceiling and wall detection, cuts, isometric camera |
 
 `-m` accepts a PLY **or** a model directory, in which case the highest
 `point_cloud/iteration_*/point_cloud.ply` wins. Iteration counts are not fixed in this repo
@@ -31,9 +33,10 @@ source of the world up axis (§3) and it supplies the camera-height guard on the
 
 Nothing here is stage-specific. Stages 1b, 1c, 5a and 5b all write plain 3DGS PLYs.
 
-**Every operation is a view-time filter.** No PLY is ever rewritten. The cut is a boolean mask
-plus one indexed gather, recomputed on GUI change rather than per frame, which is what makes it a
-live slider instead of a reload.
+**Every operation is a view-time filter.** No PLY is ever rewritten. The cuts are one fused boolean
+mask plus one indexed gather, recomputed on GUI change rather than per frame, which is what makes
+them live sliders instead of reloads. The wall cut is recomputed on azimuth change too, and costs
+the same — the four wall depths are found once at load, so orbiting only re-evaluates the mask.
 
 ---
 
@@ -98,6 +101,28 @@ walls. This is the whole reason the approach is geometric rather than a two-line
 > because stage `1c` is this viewer's stated target and the geometric path covers every producer.
 > If it is ever added it must stay a *fallback-guarded* option: applying it to a 1b/1c model
 > silently removes nothing, since every normal there is arbitrary.
+
+### Estimating the missing normals does not rescue it either
+
+The obvious workaround is to fit normals the model does not carry, by local PCA over each splat's
+neighbourhood. open3d does this fast enough to be practical — 5.2 s for 2.9M splats at k=250, a
+one-time load cost. Measured on sceneC 1c, the fraction of splats whose estimated normal aligns with
+the surface they belong to (`|n·axis| > 0.8`):
+
+| k | floor | wall band | interior control |
+|---|---|---|---|
+| 30 | 44.4% | 27.7% | 18.4% |
+| 80 | 64.6% | 27.7% | 18.4% |
+| 250 | **66.2%** | **40.9%** | 13.2% |
+
+Small neighbourhoods are hopeless — the volumetric fuzz dominates — and the floor recovers well once
+`k` is large enough to average through it. **The walls never do.** At best they reach 41% against a
+13% baseline: a 3× signal, enough to say the method is working at all, nowhere near a per-splat
+classifier. Cull at that recall and 60% of the wall stays standing.
+
+The asymmetry is the data, not the method: the floor is textured and well observed, whereas walls in
+a 6-view capture are textureless and seen at grazing angles, so they reconstruct as a thick fuzzy
+shell rather than a surface. Hence §8 cuts walls geometrically too.
 
 ---
 
@@ -324,27 +349,91 @@ Removing the ceiling is necessary but not sufficient. Walls are reconstructed on
 faces, and a 3D Gaussian looks the same from behind, so an exterior isometric view still meets two
 blank near walls.
 
-`--wall_frac` drops a slab off whichever one or two walls face the camera, recomputed as the
-azimuth changes. Walls more than ~81° off the view direction (`|cos| < 0.15`) are edge-on and
-skipped — there is nothing meaningful to remove.
+So the walls come down as well, per viewing angle: `detect_wall_planes` finds all four, and
+whichever one or two face the camera are cut, recomputed as the azimuth changes. Walls more than
+~81° off the view direction (`|cos| < 0.15`) are edge-on and skipped — there is nothing meaningful
+to remove. This is on by default; `--wall_scale 0` or `--no_wall_cut` turns it off.
 
-**Thickness is a fraction of room *height*, not of each horizontal axis.** Floor plans are not
-square — sceneC is 2.97 × 1.46 at percentile 0.5 — so an axis-relative slab would bite twice as
-deep off the long wall as the short one. Room height is the one dimension that reliably tracks
-physical scale.
+### A wall is the same shape of problem as a ceiling
 
-sceneC at percentile 3.0, azimuth 45°:
+A wall is a vertical plane, so along the horizontal axis it crosses it makes exactly the kind of
+spike the ceiling makes along up — and the same walk down to the base of the spike (§4, step 6)
+finds its inner face. `_find_slab` is that walk, shared by both; `detect_levels` and
+`detect_wall_planes` differ only in which axis they hand it and where they look along it.
 
-| `wall_frac` | gaussians kept | reads as |
+### Why per wall, and not one number for all four
+
+The four walls do not reconstruct alike. Measured thickness, as a fraction of room height:
+
+| model | u0 lo | u0 hi | u1 lo | u1 hi | spread |
+|---|---|---|---|---|---|
+| sceneC 1c | 0.140 | 0.115 | **0.075** | 0.091 | 1.9× |
+| sceneC 1b | **0.064** | 0.091 | 0.122 | 0.122 | 1.9× |
+
+Prominences run 3.25–11.50 on 1c and 3.83–12.18 on 1b, so all eight are confident detections rather
+than noise. A single global fraction has to sit somewhere in that spread: high enough for the thick
+walls and it over-cuts the thin ones, taking the furniture standing against them; low enough for the
+thin ones and the thick ones stay up. Sizing each wall to its own shell is the whole point of
+detecting them.
+
+Note also which axis is thickest flips between 1b and 1c — the min-area basis picks a different
+rotation once the floater tail shifts (§9), so `u0`/`u1` are not stable names across models. Another
+reason not to hardcode.
+
+### Defect: the search domain must be the room box
+
+The obvious range for the histogram is the 0.5/99.5 weighted percentiles, exactly as `detect_levels`
+uses for height. **It does not work here.** Indoor scans stream floaters out through windows and
+doorways, and on sceneC that tail reaches `u0 = −1.98` against a box edge of `−0.87`. An
+"outer 25%" search window then spans −1.98 … −1.25 — entirely inside the floater tail, nowhere near
+the wall at −0.776. The measured prominence was **−0.96**: a total miss on a wall that is plainly
+there, and negative because the tail is *thinner* than the room's own plateau.
+
+Histogramming over `[frame.lo[axis], frame.hi[axis]]` instead, on box-cropped splats, finds all four.
+The box is already the robust extent (§9) — it is the right domain, and the height path only gets
+away with percentiles because floaters do not pile up along up the way they do out a window.
+
+Two further restrictions on the splat set, both load-bearing: only splats **below the ceiling cut**
+and **above `floor + 15%` of room height**. The ceiling and floor span every column, so leaving
+either in flattens the contrast the wall spike is measured against — excluding them raised sceneC's
+`u1` walls from prominence 3.74/2.87 to 8.19/7.29.
+
+### Guards
+
+A wall is left standing, rather than guessed at, when any of these holds — per wall, so three clean
+walls still work when the fourth is ambiguous:
+
+| guard | why |
+|---|---|
+| prominence < 1.0 | no spike stands out of the room's plateau |
+| the walk hits `max_thick` (0.25 of room height) | it never found an inner face, so there is no shell to remove — only mush |
+| the **ceiling** was low-confidence | a scene with no ceiling is not an enclosed room |
+
+That last one is what saves sceneA. It has no ceiling (prominence 0.09), yet its raw histograms
+still offer three "walls" at prominence 1.31–3.19, one of them — `u0 hi` — with a base at `+2.05`
+lying *outside* its own plane at `+1.93`, which is geometrically incoherent. The ceiling gate
+declines all four and sceneA's kept count is identical with walls on or off. `--wall_frac` still
+forces an absolute cut on any scene if you want one.
+
+### What it costs
+
+sceneC 1c at percentile 2.0, azimuth 45°, of 4,329,736 gaussians:
+
+| | kept | reads as |
 |---|---|---|
-| 0.00 | 3,933,769 | ceiling gone, near walls still block the room |
-| 0.06 | 2,795,578 | interior visible; bed, curtains, doorway |
-| 0.12 | 2,548,155 | **clearest** — full dollhouse |
-| 0.20 | 2,092,983 | over-cut; walls mostly gone |
+| ceiling only | 3,873,745 (89.5%) | roof gone, near walls still block the room |
+| **+ auto walls** | **2,592,889 (59.9%)** | full dollhouse — bed, curtains, doorway, window |
+| `--wall_scale 2.0` | 2,151,415 (49.7%) | over-cut |
+| legacy `--wall_frac 0.10` | 2,604,729 (60.2%) | comparable here; 0.10 happens to suit this scene |
 
-0.06–0.12 reads well. **It defaults to off** because it also removes whatever furniture stands
-against those walls, which is a blunt trade the viewer should make deliberately rather than
-inherit.
+Orbiting alternates one and two walls as expected — 3,308,170 at azimuth 0°, 2,592,889 at 45°,
+3,135,174 at 90°, 2,559,653 at 135°.
+
+> ⚠ **The slab is still a slab.** It is sized to the wall rather than guessed, but it is a depth
+> range, not a segmentation: furniture flush against a removed wall loses its back few centimetres.
+> The measured improvement over a fixed fraction is real but modest — on stage 1b it recovers the
+> desk legs and the right-hand wardrobe — and mostly the win is that nothing needs tuning per scene.
+> Separating wall from furniture properly is still open; see §11.
 
 ---
 
@@ -360,10 +449,13 @@ tail that stretches the robust box along its long axis:
 | 2.0 | `[1.431, 1.737, 1.427]` | 2.665 |
 | 3.0 | `[1.685, 1.413, 1.412]` | — |
 
-Between 0.5 and 2.0 the long axis nearly halves. Since the box drives both the floater crop and
-the isometric framing (`fit_ortho_height` fits its corners), at 0.5 the room ends up small in a
-frame mostly occupied by junk. The default is therefore **2.0**, not the 0.5 that would be right
-for a clean scene.
+Between 0.5 and 2.0 the long axis nearly halves. The box drives three things — the floater crop,
+the isometric framing (`fit_ortho_height` fits its corners), and the wall search domain (§8) — so at
+0.5 the room ends up small in a frame mostly occupied by junk *and* two of the four walls stop being
+detectable, the search window landing in the tail rather than on the wall. The default is therefore
+**2.0**, not the 0.5 that would be right for a clean scene, in the viewer and in
+`dollhouse_utils.py`'s standalone diagnosis alike — a diagnosis run at a different tightness from
+the viewer would not describe what the viewer does.
 
 > The `u1`/`u2` swap between 0.5 and 2.0 is not a bug. Dropping the tail changes which rotation
 > minimises the bounding rectangle, so the min-area search picks the equivalent basis rotated by
@@ -411,8 +503,12 @@ tensor by 9×.
   as an artifact, that is a separate export not currently implemented.
 - **It is not a multi-storey solution.** The detector finds *one* ceiling. A two-floor scan would
   need per-storey segmentation along the up axis first.
-- **It does not separate wall from furniture.** §8's slab is geometric and takes both. Doing better
-  needs either anisotropic splats (§2) or a plane-fitting pass.
+- **It does not separate wall from furniture.** §8's slab is sized to each wall's own measured
+  thickness rather than guessed, but it is still a depth range and not a segmentation: whatever
+  stands flush against a removed wall loses its back few centimetres. Both routes out are measured
+  and currently closed — anisotropic splats (§2) and estimated normals (§2, 41% recall). The
+  remaining candidate is a per-column carve: grid the wall plane into (u1, h) cells and carve inward
+  only to the first density gap, so a column holding a dresser carves less than an empty one.
 - **It has no bearing on reconstruction quality.** Every artefact visible in a dollhouse render was
   already in the model; the isometric view mostly makes sparse-view failures easier to see, which
   is a large part of why it is useful.

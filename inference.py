@@ -726,6 +726,13 @@ def parse_args():
                         help="Delete an existing leave-one-out directory before stage 2a instead of "
                              "refusing. Needed because 2a only writes gt.png when absent, so a "
                              "re-run into a populated directory keeps the old targets.")
+    parser.add_argument("--orbit_min_clearance", type=float, default=-1.0,
+                        help="Minimum distance the 120-frame novel-view orbit must keep from "
+                             "reconstructed geometry. The ellipse is fitted from camera positions "
+                             "alone, so indoors it can pass through walls (sceneC: 29/120 poses "
+                             "within 0.02 of a surface). Negative = auto, matching the closest real "
+                             "photograph's own clearance -- the SfM gauge is arbitrary per solve, so "
+                             "an absolute default would not travel. 0 disables. Positive = world units.")
     parser.add_argument("--wm_loss_weight", type=float, default=0.0,
                         help="Photometric weight for pixels under the watermark mask in stages "
                              "1b/2a/2b. 0 ignores them, which is the only safe value while the "
@@ -1057,7 +1064,8 @@ def main():
             f"python scripts/train_gs_init.py -s {effective_source_path} "
             f"-m {debug_gs_init_dir} "
             f"-r {args.resolution} --sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
-            f"--white_background --random_background"
+            f"--white_background --random_background "
+            f"--orbit_min_clearance {args.orbit_min_clearance}"
         )
         run_command(cmd, dry_run=args.dry_run, stage="1a")
         log_success(f"Point cloud initialized at {debug_gs_init_dir}/point_cloud/iteration_1/point_cloud.ply")
@@ -1075,7 +1083,8 @@ def main():
             f"-r {args.resolution} --sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
             f"--white_background --random_background "
             f"--ply_path {init_ply} "
-            f"--wm_loss_weight {args.wm_loss_weight}"
+            f"--wm_loss_weight {args.wm_loss_weight} "
+            f"--orbit_min_clearance {args.orbit_min_clearance}"
         )
         run_command(cmd, dry_run=args.dry_run, stage="1b")
         log_success(f"Base 3DGS model saved to {output_gs_init_dir}")
@@ -1107,7 +1116,8 @@ def main():
             f"-r {args.resolution} --sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
             f"--white_background --random_background "
             f"--ply_path {init_ply} "
-            f"--wm_loss_weight {args.wm_loss_weight}"
+            f"--wm_loss_weight {args.wm_loss_weight} "
+            f"--orbit_min_clearance {args.orbit_min_clearance}"
             + (f" --loo_iterations {args.loo_iterations}" if args.loo_iterations else "")
         )
         run_command(cmd, dry_run=args.dry_run, stage="2a")
@@ -1122,7 +1132,8 @@ def main():
             f"-r {args.resolution} --sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
             f"--white_background --random_background "
             f"--ply_path {init_ply} "
-            f"--wm_loss_weight {args.wm_loss_weight}"
+            f"--wm_loss_weight {args.wm_loss_weight} "
+            f"--orbit_min_clearance {args.orbit_min_clearance}"
             + (f" --loo_iterations {args.loo_iterations}" if args.loo_iterations else "")
         )
         run_command(cmd, dry_run=args.dry_run, stage="2b")
@@ -1154,7 +1165,8 @@ def main():
             f"-m {output_gs_init_dir} --loo_dir {loo_dir} -o {gsfix_bundle} "
             f"-r {args.resolution} --sparse_view_num {args.num_views} "
             f"--sh_degree {args.sh_degree} --white_background "
-            f"--pairs_window {args.gsfix_pairs_window}"
+            f"--pairs_window {args.gsfix_pairs_window} "
+            f"--orbit_min_clearance {args.orbit_min_clearance}"
         )
         # The export auto-discovers the scene's mask, but an explicitly supplied
         # one has to be forwarded. Without it the fine-tune targets keep the
@@ -1287,7 +1299,8 @@ def main():
             f"--output_dir {gsfix_model_dir} "
             f"-r {args.resolution} --sparse_view_num {args.num_views} "
             f"--sh_degree {args.sh_degree} --white_background "
-            f"--anchor_every {args.gsfix_anchor_every}"
+            f"--anchor_every {args.gsfix_anchor_every} "
+            f"--orbit_min_clearance {args.orbit_min_clearance}"
         )
         run_command(cmd, dry_run=args.dry_run, stage="1c_lift")
         log_success(f"Stage 1c complete. Refined model at {gsfix_model_dir}")
@@ -1427,6 +1440,7 @@ def main():
                 f"--sparse_view_num {args.num_views} --sh_degree {args.sh_degree} "
                 f"--white_background --render_path "
                 f"--postfix _stage2 "
+                f"--orbit_min_clearance {args.orbit_min_clearance} "
                 f"--load_ply {ply_to_render}"
             )
             run_command(cmd, dry_run=args.dry_run, stage="render")

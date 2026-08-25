@@ -1,11 +1,18 @@
-"""Dollhouse post-processing for indoor 3DGS: strip the ceiling so an isometric
-view can actually see into the room.
+"""Dollhouse post-processing for indoor 3DGS: strip the ceiling and the near
+walls so an isometric view can actually see into the room.
 
-An indoor scan is photographed from *inside*, so every Gaussian that ends up on
-the ceiling sits between an elevated camera and the room. Point a viewer at the
-scene from above and you render the underside of a roof. This module removes
-that occluder geometrically and builds the isometric camera to look through the
-hole it leaves.
+An indoor scan is photographed from *inside*, so every Gaussian on the ceiling
+sits between an elevated camera and the room. Point a viewer at the scene from
+above and you render the underside of a roof. Removing the ceiling is necessary
+but not sufficient: the walls are reconstructed on their *inside* faces too, and
+a 3D Gaussian looks the same from behind, so an exterior view still meets two
+blank near walls. This module removes both occluders geometrically and builds the
+isometric camera to look through the hole they leave.
+
+The ceiling is one cut. The walls are four, of which the one or two facing the
+camera are applied, recomputed as the azimuth changes. Each is sized to its own
+reconstructed thickness rather than to a shared constant, because the four walls
+do not come out alike -- see `detect_wall_planes`.
 
 Everything here is a *view-time* filter -- nothing is written back to the PLY --
 so the cut can be dragged live in a viewer and reset without reloading.
@@ -31,6 +38,13 @@ Stages 1a and 5a/5b do *not* pass the flag and their PLYs are genuinely
 anisotropic (sceneA's 5b export: min/max scale ratio p50 0.805), so a normal
 test would work there. It is not implemented, and if it ever is it has to stay
 guarded: run against a 1b/1c model it silently removes nothing.
+
+Estimating the missing normals does not rescue the idea either. Local PCA over
+k=250 neighbours (open3d, 5.2s for 2.9M splats) recovers the *floor* well --
+66% of floor splats come out plane-coherent against a 13% baseline -- but only
+41% of wall splats do. Walls in a 6-view capture are textureless and seen at
+grazing angles, so they reconstruct as a fuzzy shell rather than a surface. A 3x
+signal is a hint, not a per-splat classifier, so walls are cut geometrically too.
 
 The room frame
 --------------
@@ -113,6 +127,53 @@ def _smooth(y, k):
         return y
     pad = k // 2
     return np.convolve(np.pad(y, pad, mode="edge"), np.ones(k) / k, mode="valid")
+
+
+def _weighted_hist(values, weights, lo, hi, bins=192, smooth=5):
+    """Opacity-weighted 1D histogram over [lo, hi], box-smoothed.
+
+    `range=` rather than clipping into it: clipping piles every outlier into the
+    two edge bins and invents a spike exactly where the plane searches look.
+    """
+    hist, edges = np.histogram(np.asarray(values, dtype=np.float64).ravel(),
+                               bins=bins, range=(lo, hi),
+                               weights=np.asarray(weights, dtype=np.float64).ravel())
+    return _smooth(hist.astype(np.float64), smooth), 0.5 * (edges[:-1] + edges[1:])
+
+
+def _find_slab(hist, ctr, lo, hi, plateau, side, search_frac=0.25, base_frac=0.2,
+               margin_frac=0.02):
+    """Locate one bounding surface: a peak near an end, then its inner base.
+
+    Shared by the ceiling (along up) and the four walls (along e1/e2) -- both are
+    planes bounding the room, so both show up the same way. `side` is +1 to
+    search the high end and walk down, -1 for the low end and walk up.
+
+    Returns `(plane, base, prominence)`, where `base` is the inner edge of the
+    reconstructed slab: everything between it and the end is that surface's own
+    thickness. The base comes from walking to where density returns to the room's
+    plateau rather than from a fixed offset off the peak, because a surface the
+    cameras barely saw reconstructs as a thin sliver and a well-observed one as a
+    broad band, and the cut has to clear whichever this is.
+    """
+    span = float(hi - lo)
+    region = (ctr > hi - search_frac * span) if side > 0 else (ctr < lo + search_frac * span)
+    ti = np.flatnonzero(region)
+    if not len(ti):
+        end = float(hi if side > 0 else lo)
+        return end, end, 0.0
+
+    ci = int(ti[np.argmax(hist[ti])])
+    peak = float(hist[ci])
+    plane = float(ctr[ci])
+    prominence = (peak - plateau) / plateau
+
+    thresh = plateau + base_frac * (peak - plateau)
+    j, step = ci, (-1 if side > 0 else 1)
+    while 0 <= j + step < len(hist) and hist[j] > thresh:
+        j += step
+    base = float(ctr[j]) - side * margin_frac * span
+    return plane, base, float(prominence)
 
 
 # --------------------------------------------------------------------------- #
@@ -351,12 +412,7 @@ def detect_levels(heights, weights, cam_heights=None, bins=192, smooth=5,
     if span <= 0:
         return Levels(lo, hi, hi, 0.0, False, "degenerate height range")
 
-    # no clipping: np.histogram's `range` already drops the tails, whereas
-    # clipping into it would pile every floater into the edge bins and invent a
-    # spike exactly where the ceiling search looks
-    hist, edges = np.histogram(h, bins=bins, range=(lo, hi), weights=w)
-    hist = _smooth(hist.astype(np.float64), smooth)
-    ctr = 0.5 * (edges[:-1] + edges[1:])
+    hist, ctr = _weighted_hist(h, w, lo, hi, bins, smooth)
 
     low = ctr < lo + 0.35 * span
     floor = float(ctr[low][int(np.argmax(hist[low]))]) if low.any() else float(lo)
@@ -366,22 +422,9 @@ def detect_levels(heights, weights, cam_heights=None, bins=192, smooth=5,
     mid = float(np.median(hist[midband])) if midband.sum() >= 4 else float(np.median(hist))
     mid = max(mid, 1e-9)
 
-    top = ctr > hi - 0.25 * span
-    ti = np.flatnonzero(top)
-    ci = int(ti[np.argmax(hist[ti])])
-    peak = float(hist[ci])
-    ceiling = float(ctr[ci])
-    prominence = (peak - mid) / mid
-
-    # Walk down the near side of the spike to where density returns to the
-    # room's own plateau. A fixed offset below the peak does not travel: a
-    # ceiling the cameras barely saw reconstructs as a thin slab, one they saw
-    # well as a broad band, and the cut has to clear whichever this is.
-    thresh = mid + base_frac * (peak - mid)
-    j = ci
-    while j > 0 and hist[j] > thresh:
-        j -= 1
-    cut = float(ctr[j]) - margin_frac * span
+    ceiling, cut, prominence = _find_slab(hist, ctr, lo, hi, mid, +1,
+                                          search_frac=0.25, base_frac=base_frac,
+                                          margin_frac=margin_frac)
 
     confident = prominence >= min_prominence
     note = (f"ceiling spike {prominence:.2f}x above the {mid:.3g} plateau; "
@@ -431,22 +474,161 @@ def histogram_ascii(levels, width=54, rows=28):
 
 
 # --------------------------------------------------------------------------- #
+# wall detection
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Wall:
+    """One of the room's four bounding walls. Heights are room coordinates."""
+    axis: int              # 0 = along e1, 1 = along e2
+    side: int              # -1 = the lo face, +1 = the hi face
+    plane: float           # spike centre: where the wall itself sits
+    edge: float            # room-box edge at detection time; the slab runs in from here
+    base: float            # inner face of the reconstructed shell
+    thickness: float       # edge -> base, i.e. how deep a cut removes just this wall
+    prominence: float
+    confident: bool
+    note: str = ""
+
+    @property
+    def name(self):
+        return f"u{self.axis} {'lo' if self.side < 0 else 'hi'}"
+
+    def describe(self):
+        flag = "" if self.confident else f"   [LOW CONFIDENCE: {self.note}]"
+        return (f"{self.name}  plane {self.plane:+.4f}  base {self.base:+.4f}  "
+                f"thickness {self.thickness:.4f}  prominence {self.prominence:.2f}{flag}")
+
+
+def detect_wall_planes(coords, weights, frame, cut, floor, room_confident=True,
+                       bins=192, smooth=5, search_frac=0.25, base_frac=0.2,
+                       margin_frac=0.02, min_prominence=1.0, min_thick=0.02,
+                       max_thick=0.25, band_frac=0.15):
+    """The four wall planes, each sized to its own reconstructed thickness.
+
+    A wall is a vertical plane, so along the horizontal axis it crosses it makes
+    the same kind of spike the ceiling makes along up -- and `_find_slab` finds
+    its inner face the same way. Doing this per wall is the point: the four do
+    not reconstruct alike. On sceneC's stage-1b model the thinnest shell is 0.023
+    of room height and the thickest 0.123, so any single global fraction
+    over-cuts one end (taking the furniture against it) while under-cutting the
+    other (leaving an occluder).
+
+    Three restrictions on the splat set, all load-bearing:
+
+    * **Inside the room box.** The obvious range is the 0.5/99.5 weighted
+      percentiles, as `detect_levels` uses for height. That fails here: indoor
+      scans stream floaters out through windows and doorways, and on sceneC the
+      tail reaches u0 = -1.98 against a box edge of -0.87, so an outer-25% search
+      window lands entirely in floaters and misses a wall that is plainly there
+      (measured prominence -0.96). The box is already the robust extent.
+    * **Below the ceiling cut**, or the ceiling slab contributes to every column.
+    * **Above the floor** by `band_frac`, for the same reason -- the floor also
+      spans every column. Excluding both raised sceneC's u1 walls from
+      prominence 3.74/2.87 to 8.19/7.29.
+
+    A wall comes back `confident=False`, and callers leave it standing, when any
+    of three things is true. It is per wall rather than a global fallback, so
+    three clean walls still work when the fourth is ambiguous:
+
+    * its spike is under `min_prominence`;
+    * the walk never found a base and ran into the `max_thick` ceiling, which
+      means there is no distinct shell to remove, only mush;
+    * `room_confident` is False. That is the caller's ceiling detection: a scene
+      with no ceiling is not an enclosed room, and walls found in one are not
+      walls. sceneA is the case -- ceiling prominence 0.09, yet the raw
+      histograms still offer up three "walls" at prominence 1.3-3.2, one of them
+      with a base outside its own plane. Pass `--wall_frac` to cut anyway.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64).ravel()
+    height = float(frame.hi[2] - frame.lo[2])
+
+    sel = np.all((coords >= frame.lo) & (coords <= frame.hi), axis=1)
+    sel &= coords[:, 2] <= cut
+    sel &= coords[:, 2] >= floor + band_frac * height
+    if int(sel.sum()) < 1000:            # nothing survived; say so rather than guess
+        return [Wall(axis, side, 0.0, 0.0, 0.0, 0.0, 0.0, False, "too few splats")
+                for axis in (0, 1) for side in (-1, +1)]
+
+    walls = []
+    for axis in (0, 1):
+        lo, hi = float(frame.lo[axis]), float(frame.hi[axis])
+        span = hi - lo
+        hist, ctr = _weighted_hist(coords[sel, axis], weights[sel], lo, hi, bins, smooth)
+        # plateau: the room's contents, away from both walls on this axis
+        band = (ctr > lo + 0.25 * span) & (ctr < hi - 0.25 * span)
+        plateau = float(np.median(hist[band])) if band.sum() >= 4 else float(np.median(hist))
+        plateau = max(plateau, 1e-9)
+
+        for side in (-1, +1):
+            plane, base, prom = _find_slab(hist, ctr, lo, hi, plateau, side,
+                                           search_frac, base_frac, margin_frac)
+            edge = hi if side > 0 else lo
+            # A sliver is more likely a stray sheet than a wall, and a quarter of
+            # the room is never wall thickness; clamp before trusting the walk.
+            raw = abs(edge - base)
+            thick = float(np.clip(raw, min_thick * height, max_thick * height))
+
+            note, ok = "", True
+            if not room_confident:
+                note, ok = "no ceiling, so not an enclosed room", False
+            elif prom < min_prominence:
+                note, ok = f"spike {prom:.2f} < {min_prominence}", False
+            elif raw > max_thick * height:
+                note, ok = f"no distinct inner face (walk ran {raw:.3f})", False
+
+            walls.append(Wall(axis=axis, side=side, plane=plane, edge=float(edge),
+                              base=float(edge - side * thick), thickness=thick,
+                              prominence=prom, confident=ok, note=note))
+    return walls
+
+
+def wall_bound(frame, axis, side, walls=None, wall_scale=1.0, wall_frac=0.0):
+    """Inner boundary of the wall slab on one face, or None to cut nothing.
+
+    Shared by the numpy mask here and the viewer's GPU path, so the two cannot
+    drift apart.
+
+    `wall_frac` is the legacy absolute control: a fraction of room *height*
+    measured from the box edge and applied identically to all four walls. When it
+    is zero, per-wall detection takes over and each face is cut back by its own
+    measured shell, scaled by `wall_scale` (1.0 = exactly the detected shell,
+    0 = no cut at all).
+
+    The slab is anchored to the box edge recorded at detection time, not to the
+    live box, so dragging the tightness slider reframes the room without also
+    moving the wall cuts.
+    """
+    if wall_frac > 0:
+        edge = float(frame.hi[axis] if side > 0 else frame.lo[axis])
+        return edge - side * wall_frac * float(frame.hi[2] - frame.lo[2])
+    if not walls or wall_scale <= 0:
+        return None
+    for w in walls:
+        if w.axis == axis and w.side == side:
+            return w.edge - side * w.thickness * wall_scale if w.confident else None
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # the cut itself
 # --------------------------------------------------------------------------- #
 
 def dollhouse_mask(coords, frame, cut=None, wall_frac=0.0, azimuth_deg=None,
-                   crop=True, crop_pad=0.02):
+                   crop=True, crop_pad=0.02, walls=None, wall_scale=1.0):
     """Boolean keep-mask over Gaussians, in room coordinates.
 
     coords : (N, 3) room-frame (u1, u2, h), i.e. `frame.to_frame(means)`.
     cut    : drop everything above this height. None keeps the ceiling.
-    wall_frac / azimuth_deg : additionally drop a slab of that fractional
-        thickness off the one or two walls facing a camera at `azimuth_deg`.
-        A room scanned from inside has walls reconstructed on their *inside*
-        faces, so an exterior isometric view is blocked by the near walls even
-        after the ceiling is gone. This is the blunt fix -- it also takes out
-        whatever furniture stands against those walls, which is why it is off by
-        default and exposed as a slider.
+    walls / wall_scale / azimuth_deg : additionally drop the one or two walls
+        facing a camera at `azimuth_deg`. A room scanned from inside has its
+        walls reconstructed on their *inside* faces, and a 3D Gaussian looks the
+        same from behind, so an exterior isometric view still meets two blank
+        near walls after the ceiling is gone. Each wall is cut back by its own
+        detected thickness (`detect_wall_planes`), scaled by `wall_scale`.
+    wall_frac : legacy absolute override -- one fraction of room height for all
+        four walls. See `wall_bound`.
     crop   : drop anything outside the robust room box, which is where sparse-view
         3DGS parks its floaters.
     """
@@ -457,20 +639,16 @@ def dollhouse_mask(coords, frame, cut=None, wall_frac=0.0, azimuth_deg=None,
         pad = crop_pad * frame.size
         keep &= np.all(coords >= (frame.lo - pad), axis=1)
         keep &= np.all(coords <= (frame.hi + pad), axis=1)
-    if wall_frac > 0 and azimuth_deg is not None:
+    if azimuth_deg is not None:
         a = math.radians(azimuth_deg)
-        # Thickness is a fraction of room *height*, not of each horizontal axis.
-        # Floor plans are not square -- sceneC is 2.97 x 1.46 -- so an axis-relative
-        # slab would bite twice as deep off the long wall as the short one. Room
-        # height is the one dimension that reliably tracks physical scale.
-        t = wall_frac * (frame.hi[2] - frame.lo[2])
         for axis, comp in ((0, math.cos(a)), (1, math.sin(a))):
             if abs(comp) < 0.15:      # edge-on wall: nothing meaningful to remove
                 continue
-            if comp > 0:
-                keep &= coords[:, axis] <= frame.hi[axis] - t
-            else:
-                keep &= coords[:, axis] >= frame.lo[axis] + t
+            side = 1 if comp > 0 else -1
+            bound = wall_bound(frame, axis, side, walls, wall_scale, wall_frac)
+            if bound is None:
+                continue
+            keep &= (coords[:, axis] <= bound) if side > 0 else (coords[:, axis] >= bound)
     return keep
 
 
@@ -581,7 +759,13 @@ def _main():
     ap.add_argument("-c", "--cameras", default=None, help="cameras.json for up-axis estimation")
     ap.add_argument("--up", default=None, help="override: x|-x|y|-y|z|-z or 'a,b,c'")
     ap.add_argument("--opacity_min", type=float, default=0.1)
-    ap.add_argument("--percentile", type=float, default=0.5)
+    # 2.0, matching the viewer. At 0.5 the floater tail stretches the box itself
+    # (sceneC: 2.97 wide against 1.74), and since the box is the wall search
+    # domain that costs two of the four walls -- so a 0.5 diagnosis would not
+    # describe what the viewer actually does. See dollhouse.md section 9.
+    ap.add_argument("--percentile", type=float, default=2.0)
+    ap.add_argument("--azimuth", type=float, default=45.0,
+                    help="viewing azimuth to report the wall cut for")
     args = ap.parse_args()
 
     ply = latest_gs_ply(args.model)
@@ -612,8 +796,22 @@ def _main():
     print(f"[i] {lv.describe()}")
     print(histogram_ascii(lv))
 
+    walls = detect_wall_planes(coords[sel], opac[sel], frame, lv.cut, lv.floor,
+                               room_confident=lv.confident)
+    print("[i] walls:")
+    for wl in walls:
+        print(f"      {wl.describe()}")
+    weak = [wl.name for wl in walls if not wl.confident]
+    if weak:
+        print(f"    {len(weak)} of 4 not confident ({', '.join(weak)}); those are left uncut")
+
     keep = dollhouse_mask(coords, frame, cut=lv.cut)
-    print(f"[i] dollhouse keeps {keep.sum():,} / {len(keep):,} "
+    print(f"[i] ceiling only keeps {keep.sum():,} / {len(keep):,} "
+          f"({100.0 * keep.mean():.1f}%) -- removed {(~keep).sum():,}")
+
+    keep = dollhouse_mask(coords, frame, cut=lv.cut, walls=walls,
+                          azimuth_deg=args.azimuth)
+    print(f"[i] + walls at azimuth {args.azimuth:g} keeps {keep.sum():,} / {len(keep):,} "
           f"({100.0 * keep.mean():.1f}%) -- removed {(~keep).sum():,}")
 
 

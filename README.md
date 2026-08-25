@@ -87,9 +87,10 @@ python viz.py -i output/sceneA --serve --port 9876 --timeline
 
 Renders a finished 3DGS model in the browser (viser + nerfview + gsplat) with the post-processing
 an **indoor** scan needs before an isometric view shows anything. A room is photographed from
-inside, so the ceiling sits between an elevated camera and the room; the ceiling is detected from
-the height distribution and removed at view time, leaving a dollhouse view under a genuine
-orthographic projection. Requires `uv sync --extra viewer`.
+inside, so both the ceiling and the near walls sit between an elevated camera and the room. Both
+are detected and removed at view time -- the ceiling from the height distribution, the walls from
+the same spike-walk along each horizontal axis and applied per viewing angle -- leaving a dollhouse
+view under a genuine orthographic projection. Requires `uv sync --extra viewer`.
 
 ```bash
 # Serve web viewer (open http://localhost:8080 in your browser)

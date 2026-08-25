@@ -282,7 +282,26 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, extra_opts=None, ply_ini
     test_cam_infos = [cam_infos[i] for i in test_ids]
     # print(train_cam_infos)
 
-    render_cam_infos = generate_ellipse_path_from_camera_infos(cam_infos)
+    # The orbit is fitted from camera positions alone, so nothing stops it
+    # passing through walls. Hand it the fused SfM cloud so it can shrink until
+    # it clears geometry. Read here rather than reusing the load further down --
+    # that one happens ~200 lines later, after the path is already built.
+    orbit_points = None
+    orbit_clearance = getattr(extra_opts, "orbit_min_clearance", 0.0) if extra_opts else 0.0
+    if orbit_clearance != 0.0:
+        for cand in (osp.join(path, "points.ply"), osp.join(path, "sparse", "0", "points3D.ply")):
+            if osp.exists(cand):
+                try:
+                    _pcd = fetchPly(cand)
+                    orbit_points = np.asarray(_pcd.points)
+                    break
+                except Exception as e:
+                    print(f"[!] Could not read {cand} for orbit clearance: {e}")
+        if orbit_points is None:
+            print(f"[!] No point cloud under {path} for orbit clearance; leaving the path unconstrained.")
+
+    render_cam_infos = generate_ellipse_path_from_camera_infos(
+        cam_infos, clearance_points=orbit_points, min_clearance=orbit_clearance)
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 

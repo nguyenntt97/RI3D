@@ -65,6 +65,17 @@ class ModelParams(ParamGroup):
         # region constrain the Gaussians without invented content outweighing real
         # photographs.
         self.wm_loss_weight = 0.0
+        # Minimum distance the novel-view orbit must keep from reconstructed
+        # geometry. The ellipse is fitted from camera positions alone and knows
+        # nothing about walls, so indoors it can pass straight through them --
+        # measured on sceneC, 29 of 120 poses sat within 0.02 of a surface.
+        #   < 0  auto: match the closest real photograph's own clearance. The SfM
+        #        gauge is arbitrary per solve, so an absolute default would not
+        #        travel between scenes or backends; deriving it from the capture
+        #        does.
+        #   = 0  disabled, the historical unconstrained path.
+        #   > 0  explicit distance in world units.
+        self.orbit_min_clearance = -1.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

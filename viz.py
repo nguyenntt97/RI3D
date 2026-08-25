@@ -347,6 +347,9 @@ def discover_pipeline_artifacts(root_path: str, sfm_backend: str = "auto") -> Di
         'gs_base_ply': None,
         'loo_dirs': [],
         'diffs_pkl': None,
+        'gsfix_novel_views': None,
+        'gsfix_render_dir': None,
+        'gsfix_fixed_dir': None,
         'repair_ply': None,
         'inpainting_ply': None,
         'final_ply': None,
@@ -509,6 +512,31 @@ def discover_pipeline_artifacts(root_path: str, sfm_backend: str = "auto") -> Di
                         if os.path.isdir(full_leave) and leave_dir.startswith("leave_"):
                             artifacts['loo_dirs'].append(full_leave)
 
+    # 4b. Stage 1c GSFix3D bundle (novel-view trajectory + renders/repairs)
+    gsfix_candidates = [
+        os.path.join(scene_dir, "output", "gsfix_data"),
+        "output/gsfix_data",
+        os.path.join(scene_dir, "gsfix_data"),
+    ]
+    for d in gsfix_candidates:
+        if not os.path.isdir(d):
+            continue
+        for scene_sub in sorted(os.listdir(d)):
+            if base_scene_name not in scene_sub:
+                continue
+            bundle = os.path.join(d, scene_sub)
+            nv = os.path.join(bundle, "novel_views.json")
+            if os.path.isfile(nv):
+                artifacts['gsfix_novel_views'] = nv
+            # The render subdirectory is named for --recon_tag, so glob it
+            # rather than assuming the default 'ri3d'.
+            for rd in sorted(glob.glob(os.path.join(bundle, "rendered_novel_views", "gs_image_*"))):
+                artifacts['gsfix_render_dir'] = rd
+                break
+            fixed = os.path.join(bundle, "fixed", "rgb")
+            if os.path.isdir(fixed) and os.listdir(fixed):
+                artifacts['gsfix_fixed_dir'] = fixed
+
     # 5. Stage 5a Repair & 5b Inpainting
     for den_dir in glob.glob(f"output_den*/**/{base_scene_name}_*") + glob.glob(f"{scene_dir}/output_den*/**/{base_scene_name}_*"):
         last_ply = glob.glob(f"{den_dir}/**/last.ply", recursive=True)
@@ -612,6 +640,141 @@ def log_camera_and_views(artifacts: Dict, timeline: bool = False):
                 print(f"[!] Could not load depth map '{d_file}': {e}")
 
 
+def log_gsfix_trajectory(artifacts: Dict, stride: int = 10, timeline: bool = False):
+    """Log the stage-1c novel-view orbit: path, frustums, and the images on it.
+
+    These are the viewpoints GSFixer repairs and scripts/refine_gs_gsfix.py then
+    optimises against, so seeing where they actually go is the quickest way to
+    tell whether the orbit leaves the observed volume -- which is the failure
+    mode that makes the repair prior hallucinate rather than repair.
+
+    tools/gsfix_export.py writes `extrinsic` as world->camera in the OpenCV
+    convention that getWorld2View builds, which is already the RDF basis
+    rr.Pinhole expects. Unlike parse_transforms_json above there is no y/z flip
+    to undo here.
+    """
+    nv_path = artifacts.get('gsfix_novel_views')
+    if not nv_path:
+        return
+
+    try:
+        with open(nv_path, 'r') as f:
+            views = json.load(f)
+    except Exception as e:
+        print(f"[!] Could not read {nv_path}: {e}")
+        return
+    if not views:
+        return
+
+    render_dir = artifacts.get('gsfix_render_dir')
+    fixed_dir = artifacts.get('gsfix_fixed_dir')
+    print(f"[+] Logging stage-1c novel-view trajectory ({len(views)} poses, "
+          f"frustum every {stride})...")
+
+    centers, c2ws = [], []
+    for v in views:
+        w2c = np.array(v['extrinsic'], dtype=np.float32)
+        c2w = np.linalg.inv(w2c)
+        c2ws.append(c2w)
+        centers.append(c2w[:3, 3])
+    centers = np.array(centers, dtype=np.float32)
+
+    # The ellipse path is a closed loop, so join the last pose back to the first.
+    rr.log(
+        "world/gsfix/trajectory",
+        rr.LineStrips3D(
+            [np.vstack([centers, centers[:1]])],
+            colors=[[255, 140, 0]],
+            radii=[0.002],
+        ),
+    )
+    # Clearance against the scene cloud. The orbit is fitted from camera
+    # positions alone, so indoors it can pass through walls -- colouring the
+    # offenders is the quickest way to see whether --orbit_min_clearance did its
+    # job, and it keeps working as a check on new scenes.
+    pose_colors = np.tile(np.array([[255, 190, 90]], dtype=np.uint8), (len(centers), 1))
+    scene_ply = next((p for p, _ in artifacts.get('sfm_plys', [])
+                      if os.path.basename(p) == "points.ply"), None)
+    if scene_ply is None and artifacts.get('sfm_plys'):
+        scene_ply = artifacts['sfm_plys'][0][0]
+    if scene_ply and os.path.isfile(scene_ply):
+        try:
+            pts_xyz = load_ply_points_and_colors(scene_ply, max_points=200000)[0]
+            # graphics_utils, not camera_utils: the latter imports scene.cameras,
+            # and scene/__init__ imports back into camera_utils, so reaching for it
+            # here trips a partially-initialised circular import.
+            from utils.graphics_utils import scene_clearance
+            clear = scene_clearance(centers, pts_xyz)
+            # Reference: how close the real photographs themselves got.
+            ref = None
+            if artifacts.get('transforms_json'):
+                tf_frames = parse_transforms_json(artifacts['transforms_json'])
+                tcen = np.array([f['c2w'][:3, 3] for f in tf_frames if f['c2w'] is not None])
+                if len(tcen):
+                    ref = float(scene_clearance(tcen, pts_xyz).min())
+            thr = ref if ref is not None else float(np.percentile(clear, 10))
+            bad = clear < thr
+            pose_colors[bad] = np.array([220, 40, 40], dtype=np.uint8)
+            print(f"    clearance: min={clear.min():.4f} p10={np.percentile(clear,10):.4f} "
+                  f"median={np.median(clear):.4f}"
+                  + (f" | closest training camera={ref:.4f}" if ref is not None else ""))
+            print(f"    poses closer to geometry than any real photograph: {int(bad.sum())}/{len(clear)}"
+                  + ("  <- red in the viewer" if bad.any() else ""))
+            for i in np.where(bad)[0]:
+                rr.log(f"world/gsfix/violations/{i:05d}",
+                       rr.Points3D(centers[i:i+1], colors=[[220, 40, 40]], radii=0.012))
+        except Exception as e:
+            print(f"[!] Could not compute orbit clearance: {e}")
+
+    rr.log(
+        "world/gsfix/orbit_poses",
+        rr.Points3D(centers, colors=pose_colors, radii=0.004),
+    )
+
+    def _intrinsics(v):
+        w, h = int(v['width']), int(v['height'])
+        return w, h, 0.5 * w / math.tan(0.5 * float(v['FoVx'])), \
+               0.5 * h / math.tan(0.5 * float(v['FoVy']))
+
+    def _image_for(v, idx, directory):
+        if not directory:
+            return None
+        cand = os.path.join(directory, v.get('file', f"{idx:05d}.png"))
+        return cand if os.path.isfile(cand) else None
+
+    # Static frustums: a readable subset, otherwise 120 cones bury the scene.
+    for idx in range(0, len(views), max(1, stride)):
+        v, c2w = views[idx], c2ws[idx]
+        w, h, fx, fy = _intrinsics(v)
+        ent = f"world/gsfix/frustums/{idx:05d}"
+        rr.log(ent, rr.Pinhole(resolution=[w, h], focal_length=[fx, fy],
+                               principal_point=[w / 2.0, h / 2.0]))
+        rr.log(ent, rr.Transform3D(mat3x3=c2w[:3, :3], translation=c2w[:3, 3]))
+
+    # Scrubbable pass: every pose, with the render and its repair side by side
+    # on the same frustum, so a bad repair is attributable to a viewpoint.
+    if timeline:
+        for idx, (v, c2w) in enumerate(zip(views, c2ws)):
+            rr.set_time("gsfix_orbit", sequence=idx)
+            w, h, fx, fy = _intrinsics(v)
+            ent = "world/gsfix/orbit_cam"
+            rr.log(ent, rr.Pinhole(resolution=[w, h], focal_length=[fx, fy],
+                                   principal_point=[w / 2.0, h / 2.0]))
+            rr.log(ent, rr.Transform3D(mat3x3=c2w[:3, :3], translation=c2w[:3, 3]))
+            before = _image_for(v, idx, render_dir)
+            if before:
+                rr.log(f"{ent}/render", rr.Image(np.array(Image.open(before).convert("RGB"))))
+            after = _image_for(v, idx, fixed_dir)
+            if after:
+                rr.log("gsfix/repaired", rr.Image(np.array(Image.open(after).convert("RGB"))))
+        rr.reset_time()
+
+    span = centers.max(axis=0) - centers.min(axis=0)
+    print(f"    orbit extent: [{span[0]:.3f}, {span[1]:.3f}, {span[2]:.3f}] "
+          f"| renders: {'yes' if render_dir else 'no'} "
+          f"| repairs: {'yes' if fixed_dir else 'no'}")
+
+
 def log_point_clouds(artifacts: Dict, max_points: int = 500000, timeline: bool = False):
     """Logs all available 3D point clouds across estimation stages."""
     stages = []
@@ -640,7 +803,7 @@ def log_point_clouds(artifacts: Dict, max_points: int = 500000, timeline: bool =
             print(f"[+] Loading {stage_tag} ({name}) from {ply_file}...")
 
             if timeline:
-                rr.set_time("pipeline_stage", stage_step)
+                rr.set_time("pipeline_stage", sequence=stage_step)
 
             xyz, rgb, opacities, scales = load_ply_points_and_colors(ply_file, max_points=max_points)
             if len(xyz) == 0:
@@ -668,8 +831,8 @@ def log_point_clouds(artifacts: Dict, max_points: int = 500000, timeline: bool =
             leave_name = Path(loo_dir).name
             entity_path = f"world/leave_one_out/{leave_name}"
             if timeline:
-                rr.set_time("pipeline_stage", 3)
-                rr.set_time("loo_view", l_idx)
+                rr.set_time("pipeline_stage", sequence=3)
+                rr.set_time("loo_view", sequence=l_idx)
 
             xyz, rgb, _, _ = load_ply_points_and_colors(loo_plys[0], max_points=max_points)
             if len(xyz) > 0:
@@ -907,6 +1070,13 @@ def parse_args():
         help="Confidence threshold for filtering pointmaps (defaults to auto/conf_thr from stats).",
     )
     parser.add_argument(
+        "--gsfix_stride",
+        type=int,
+        default=10,
+        help="Log one stage-1c orbit frustum every N poses (120 poses total). "
+             "Use --timeline to scrub every pose with its render and repair.",
+    )
+    parser.add_argument(
         "--timeline",
         action="store_true",
         help="Structure artifacts along a timeline sequence for progressive scrubber replay.",
@@ -976,6 +1146,9 @@ def main():
     print(f"  • Stage 1b (Base 3DGS): {artifacts['gs_base_ply'] or 'None'}")
     print(f"  • Stage 2 (LOO Dirs):   {len(artifacts['loo_dirs'])} folder(s)")
     print(f"  • LOO Diff Stats:       {artifacts['diffs_pkl'] or 'None'}")
+    print(f"  • Stage 1c Orbit:       {artifacts['gsfix_novel_views'] or 'None'}")
+    print(f"  • Stage 1c Renders:     {artifacts['gsfix_render_dir'] or 'None'}")
+    print(f"  • Stage 1c Repairs:     {artifacts['gsfix_fixed_dir'] or 'None'}")
     print(f"  • Stage 5a (Repair):    {artifacts['repair_ply'] or 'None'}")
     print(f"  • Stage 5b (Inpaint):   {artifacts['inpainting_ply'] or 'None'}")
     print(f"  • Final Reconstruction: {artifacts['final_ply'] or 'None'}\n")
@@ -1012,6 +1185,9 @@ def main():
 
     # 3. Log cameras and 2D views
     log_camera_and_views(artifacts, timeline=args.timeline)
+
+    # 3b. Log the stage-1c novel-view orbit
+    log_gsfix_trajectory(artifacts, stride=args.gsfix_stride, timeline=args.timeline)
 
     # 4. Log SfM dense pointmaps & triangulated DLT anchors
     log_sfm_pointmaps(artifacts, min_conf=args.min_conf, max_points=args.max_points // 2)

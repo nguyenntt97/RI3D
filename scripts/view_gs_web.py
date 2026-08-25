@@ -3,8 +3,14 @@
 
 Renders a stage-1c (or any) 3DGS model in a browser through viser + nerfview +
 gsplat, and adds the post-processing an *indoor* scan needs before an isometric
-view shows anything useful: the ceiling is detected and removed at view time, so
-the camera can look down into the room instead of at the underside of a roof.
+view shows anything useful. A room is photographed from inside, so both the
+ceiling and the near walls sit between an elevated camera and the room. Both are
+detected and removed at view time: the ceiling once, the walls per viewing angle,
+so orbiting always looks into the room rather than at the back of an occluder.
+
+Each wall is cut back by its *own* measured thickness -- the four do not
+reconstruct alike -- and a wall the detector cannot find is left standing rather
+than guessed at. `--wall_scale` scales the cut, `--no_wall_cut` disables it.
 
 The projection is genuinely orthographic -- gsplat's `camera_model="ortho"` --
 rather than a long-lens perspective fake, so parallel edges stay parallel and the
@@ -40,9 +46,9 @@ from plyfile import PlyData
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.dollhouse_utils import (  # noqa: E402
-    ISO_ELEVATION_DEG, build_room_frame, detect_levels, dollhouse_mask,
+    ISO_ELEVATION_DEG, build_room_frame, detect_levels, detect_wall_planes,
     estimate_up, fit_ortho_height, histogram_ascii, isometric_c2w,
-    latest_gs_ply, ortho_K, perspective_to_ortho,
+    latest_gs_ply, ortho_K, perspective_to_ortho, wall_bound,
 )
 
 try:
@@ -135,8 +141,10 @@ class Dollhouse:
 
     MODES = ("dollhouse", "removed only", "everything")
 
-    def __init__(self, gs, frame, levels, background=(1.0, 1.0, 1.0), device="cuda"):
+    def __init__(self, gs, frame, levels, walls=(), background=(1.0, 1.0, 1.0),
+                 device="cuda"):
         self.gs, self.frame, self.levels, self.device = gs, frame, levels, device
+        self.walls = list(walls)
         # gsplat 1.5.3 documents `backgrounds` as [C, channels], but under the
         # default packed=True path `image_dims` collapses to () (cuda/_wrapper.py:867),
         # so the assert actually wants a bare [channels].
@@ -147,7 +155,9 @@ class Dollhouse:
         self.coords_np = frame.to_frame(gs["means_np"])
         self.cut = levels.cut
         self.box_percentile = frame.percentile
-        self.wall_frac = 0.0
+        self.wall_cut = True
+        self.wall_scale = 1.0
+        self.wall_frac = 0.0          # legacy absolute override; 0 = use detection
         self.azimuth = 45.0
         self.opacity_min = 0.0
         self.crop = True
@@ -168,14 +178,20 @@ class Dollhouse:
             if self.crop:
                 pad = 0.02 * (hi - lo)
                 keep &= ((self.coords >= (lo - pad)) & (self.coords <= (hi + pad))).all(1)
-            if self.wall_frac > 0:
+            if self.wall_cut:
+                # Same boundaries as dollhouse_mask, through the same helper, so
+                # the GPU path here and the numpy one cannot drift apart.
                 a = math.radians(self.azimuth)
-                t = self.wall_frac * float(hi[2] - lo[2])   # see dollhouse_mask
                 for ax, comp in ((0, math.cos(a)), (1, math.sin(a))):
-                    if abs(comp) < 0.15:
+                    if abs(comp) < 0.15:      # edge-on wall: nothing to remove
                         continue
-                    keep &= (self.coords[:, ax] <= hi[ax] - t) if comp > 0 \
-                        else (self.coords[:, ax] >= lo[ax] + t)
+                    side = 1 if comp > 0 else -1
+                    b = wall_bound(f, ax, side, self.walls, self.wall_scale,
+                                   self.wall_frac)
+                    if b is None:             # low-confidence wall: leave it up
+                        continue
+                    keep &= (self.coords[:, ax] <= b) if side > 0 \
+                        else (self.coords[:, ax] >= b)
         if self.opacity_min > 0:
             keep &= gs["opacities"] > self.opacity_min
         if self.mode == "removed only":
@@ -227,12 +243,13 @@ def _label(img, text):
     return np.asarray(im)
 
 
-def screenshot(house, out_prefix, width, height, elevation, zoom, azimuths, wall_frac):
+def screenshot(house, out_prefix, width, height, elevation, zoom, azimuths):
     """Headless POC: the occlusion, the fix, and the fix from four corners."""
     from PIL import Image
     out = Path(out_prefix)
     out.parent.mkdir(parents=True, exist_ok=True)
     az0 = azimuths[0]
+    wall_cut = house.wall_cut
 
     def shot(az):
         house.azimuth = az
@@ -240,29 +257,30 @@ def screenshot(house, out_prefix, width, height, elevation, zoom, azimuths, wall
         return house.render_isometric(width, height, az, elevation, zoom), house.kept
 
     # 1. the problem: an indoor scan viewed from above is a roof
-    house.mode, house.wall_frac = "everything", 0.0
+    house.mode, house.wall_cut = "everything", False
     before, n_before = shot(az0)
     Image.fromarray(before).save(f"{out}_ceiling_on.png")
 
-    # 2. the fix: ceiling removed
-    house.mode, house.wall_frac = "dollhouse", 0.0
+    # 2. the ceiling alone is not enough -- the near walls still block the room
+    house.mode, house.wall_cut = "dollhouse", False
     cut_only, n_cut = shot(az0)
 
     # 3. the full dollhouse: near walls taken down too
-    house.wall_frac = wall_frac if wall_frac > 0 else 0.10
+    house.wall_cut = wall_cut
     walls, n_walls = shot(az0)
     Image.fromarray(walls).save(f"{out}_dollhouse.png")
 
+    label3 = (f"+ near walls x{house.wall_scale:.2f}" if not house.wall_frac
+              else f"+ near-wall slab {house.wall_frac:.2f}")
     compare = np.concatenate([
         _label(before, f"ceiling intact  ({n_before:,})"),
         _label(cut_only, f"ceiling cut at h={house.cut:+.3f}  ({n_cut:,})"),
-        _label(walls, f"+ near-wall slab {house.wall_frac:.2f}  ({n_walls:,})"),
+        _label(walls, f"{label3}  ({n_walls:,})"),
     ], axis=1)
     Image.fromarray(compare).save(f"{out}_compare.png")
     print(f"[i] {out}_compare.png   before / ceiling cut / full dollhouse")
 
     # 4. the dollhouse from every corner
-    house.wall_frac = wall_frac if wall_frac > 0 else 0.10
     tiles = []
     for az in azimuths:
         img, kept = shot(az)
@@ -306,7 +324,8 @@ def serve(house, host, port, ortho_default=True):
         g_mode = server.gui.add_dropdown("Show", Dollhouse.MODES, initial_value="dollhouse")
         g_cut = server.gui.add_slider("Ceiling cut", float(frame.lo[2]), float(frame.hi[2]),
                                       span / 400.0, float(house.cut))
-        g_wall = server.gui.add_slider("Near-wall slab", 0.0, 0.40, 0.005, 0.0)
+        g_wallon = server.gui.add_checkbox("Cut near walls", house.wall_cut)
+        g_wall = server.gui.add_slider("Wall cut x", 0.0, 2.0, 0.05, house.wall_scale)
         g_opac = server.gui.add_slider("Min opacity", 0.0, 0.9, 0.01, 0.0)
         g_crop = server.gui.add_checkbox("Crop floaters to room box", True)
         g_box = server.gui.add_slider("Room box tightness (%)", 0.1, 12.0, 0.1,
@@ -323,17 +342,25 @@ def serve(house, host, port, ortho_default=True):
 
     def info():
         pct = 100.0 * house.kept / max(house.total, 1)
+        wall_txt = " · ".join(
+            f"`{w.name}` {w.thickness:.3f}" if w.confident else f"`{w.name}` —"
+            for w in house.walls
+        )
+        weak = [w.name for w in house.walls if not w.confident]
         g_info.content = (
             f"**{house.kept:,}** / {house.total:,} gaussians ({pct:.1f}%)\n\n"
             f"floor `{lv.floor:+.3f}` · ceiling `{lv.ceiling:+.3f}` · "
             f"cut `{house.cut:+.3f}`"
             + ("" if lv.confident else "\n\n⚠ ceiling detection was low-confidence")
+            + (f"\n\nwall thickness — {wall_txt}" if house.walls else "")
+            + (f"\n\n⚠ no wall found for {', '.join(weak)}; left uncut" if weak else "")
         )
 
     def refresh(_=None):
         house.mode = g_mode.value
         house.cut = g_cut.value
-        house.wall_frac = g_wall.value
+        house.wall_cut = g_wallon.value
+        house.wall_scale = g_wall.value
         house.opacity_min = g_opac.value
         house.crop = g_crop.value
         house.box_percentile = g_box.value
@@ -342,7 +369,7 @@ def serve(house, host, port, ortho_default=True):
         info()
         viewer.rerender(None)
 
-    for w in (g_mode, g_cut, g_wall, g_opac, g_crop, g_box):
+    for w in (g_mode, g_cut, g_wallon, g_wall, g_opac, g_crop, g_box):
         w.on_update(refresh)
 
     @g_auto.on_click
@@ -447,8 +474,15 @@ def main():
     ap.add_argument("--elevation", type=float, default=ISO_ELEVATION_DEG)
     ap.add_argument("--azimuths", default="45,135,225,315")
     ap.add_argument("--zoom", type=float, default=1.0)
+
+    ap.add_argument("--wall_scale", type=float, default=1.0,
+                    help="multiplier on each wall's own detected thickness "
+                         "(1.0 = exactly the detected shell, 0 = no wall cut)")
+    ap.add_argument("--no_wall_cut", action="store_true",
+                    help="keep the near walls; cut only the ceiling")
     ap.add_argument("--wall_frac", type=float, default=0.0,
-                    help="headless: also cut a slab off the near walls")
+                    help="legacy override: one absolute slab thickness, as a "
+                         "fraction of room height, for all four walls")
 
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
@@ -489,8 +523,20 @@ def main():
     if args.screenshot:
         print(histogram_ascii(levels))
 
+    walls = detect_wall_planes(coords_sel, gs["opac_np"][sel], frame,
+                               levels.cut, levels.floor,
+                               room_confident=levels.confident)
+    print("[i] walls:")
+    for w in walls:
+        print(f"      {w.describe()}")
+    weak = [w.name for w in walls if not w.confident]
+    if weak:
+        print(f"    {len(weak)} of 4 not confident ({', '.join(weak)}); left uncut")
+
     bg = (1.0, 1.0, 1.0) if args.background == "white" else (0.0, 0.0, 0.0)
-    house = Dollhouse(gs, frame, levels, background=bg, device=args.device)
+    house = Dollhouse(gs, frame, levels, walls=walls, background=bg, device=args.device)
+    house.wall_cut = not args.no_wall_cut
+    house.wall_scale = args.wall_scale
     house.wall_frac = args.wall_frac
     house.rebuild()
     print(f"[i] dollhouse keeps {house.kept:,} / {house.total:,} "
@@ -499,7 +545,7 @@ def main():
     if args.screenshot:
         azimuths = [float(a) for a in args.azimuths.split(",")]
         screenshot(house, args.screenshot, args.width, args.height,
-                   args.elevation, args.zoom, azimuths, args.wall_frac)
+                   args.elevation, args.zoom, azimuths)
         return
     serve(house, args.host, args.port, ortho_default=not args.perspective)
 

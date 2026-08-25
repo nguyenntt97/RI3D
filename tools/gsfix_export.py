@@ -213,6 +213,21 @@ def export_novel_views(scene, gaussians, pipeline, background, out_dir, tag):
     os.makedirs(before_dir, exist_ok=True)
 
     views = scene.getRenderCameras()
+
+    # Re-rendering the orbit invalidates any repairs sitting in fixed/rgb: they
+    # were produced from the previous poses, and refine_gs_gsfix.py pairs them
+    # with render cameras by sorted filename, so a stale set would be silently
+    # matched to the wrong viewpoints. Same class of trap as the leave-one-out
+    # gt.png guard. Clear them rather than leave a mismatch behind.
+    stale_fixed = os.path.join(out_dir, "fixed", "rgb")
+    if os.path.isdir(stale_fixed):
+        n_stale = len([f for f in os.listdir(stale_fixed) if f.lower().endswith(".png")])
+        if n_stale:
+            print(f"[!] Removing {n_stale} repaired image(s) in {stale_fixed}: they belong to the "
+                  f"previous orbit. Re-run GSFixer inference before the lift.")
+            shutil.rmtree(stale_fixed)
+            os.makedirs(stale_fixed, exist_ok=True)
+
     meta = []
     for idx, view in enumerate(tqdm(views, desc="Rendering orbit")):
         pkg = render(view, gaussians, pipeline, background, test=False)

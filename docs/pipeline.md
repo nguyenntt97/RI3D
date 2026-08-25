@@ -299,6 +299,35 @@ final export and stage 3's `--gs_dir`.
 > `utils/dataset_lora.py:214` feeds the raw photograph as the LoRA target, so on a watermarked scene
 > the Repair prior learns the watermark too. `clean_watermark` is written to be reusable there.
 
+> **The orbit is kept clear of walls.** `generate_ellipse_path_from_poses` fits the ellipse from
+> camera *positions* only — a PCA frame and semi-axes at the 90th percentile of the camera spread.
+> Nothing in it knows where geometry is, so indoors it drives cameras through walls: measured on
+> sceneC, **29 of 120 poses sat within 0.02 of a surface** (p0 = 0.0016, scene diagonal 3.17), and
+> for 96/120 the nearest surface was horizontal — walls, not floor. Outlier removal left the numbers
+> unchanged, so this was real reconstructed geometry rather than SfM floaters.
+>
+> `--orbit_min_clearance` binary-searches a global scale on the semi-axes until every pose clears a
+> target. Scaling the whole ellipse rather than nudging individual poses matters: the path is both a
+> video trajectory and a training-view sequence, and per-pose displacement kinks both. Measured
+> smoothness (`max step / median step`) stays at exactly 1.000, because the const-speed resampling
+> regenerates around the scaled ellipse.
+>
+> **The default is `-1` — auto, meaning "come no closer to geometry than the closest real
+> photograph did."** An absolute default cannot work: the SfM gauge is arbitrary per solve (see the
+> MASt3R 0.75–19.8 vs GGPT 0.01–1.36 note above), so a threshold tuned on one scene is meaningless
+> on the next. Deriving it from the capture travels. On sceneC that is 0.0718, reached at scale
+> 0.621: p0 0.0016 → 0.0722, median 0.074 → 0.253, **0/120 violations**. `0` restores the old
+> unconstrained path bit-for-bit; a positive value is an explicit distance in world units.
+>
+> If even the floor scale cannot reach the target the run warns and continues with the tightest
+> path — that is the "focal region is itself inside geometry" case, which shrinking cannot fix.
+>
+> Re-running the export after changing this **deletes `fixed/rgb`**: repairs belong to the poses
+> they were made from, and `refine_gs_gsfix.py` pairs them with render cameras by sorted filename,
+> so a stale set would be silently matched to the wrong viewpoints. Re-run GSFixer inference.
+>
+> `python viz.py -i <out>` reports orbit clearance and colours violating poses red.
+
 > **`--gsfix_anchor_every` guards against drift.** Upstream `refine_gs.py` fits each repaired view
 > for 20 iterations with no ground-truth term — roughly 2400 unanchored steps across the orbit,
 > which can pull the model off the real photographs. The default injects one sparse-photograph step
@@ -403,8 +432,12 @@ preferring 5b → 5a → the highest-iteration stage-1b checkpoint.
 
 `scripts/view_gs_web.py` serves any stage's PLY in a browser through viser + nerfview + gsplat,
 and adds the post-processing an **indoor** scan needs before an isometric view shows anything: a
-room is photographed from inside, so every Gaussian on the ceiling sits between an elevated camera
-and the room, and a top-down view renders the underside of a roof.
+room is photographed from inside, so both the ceiling and the near walls sit between an elevated
+camera and the room, and a top-down view renders the underside of a roof.
+
+Both are detected and removed at view time — the ceiling once, the walls per viewing angle, each
+sized to its own reconstructed thickness — so orbiting always looks into the room. A wall the
+detector cannot find is left standing rather than guessed at.
 
 ```bash
 uv sync --extra viewer      # viser + nerfview; nothing in the pipeline imports them
@@ -426,29 +459,37 @@ SfM cameras are the only reliable source of the world up axis.
 `utils/dollhouse_utils.py` holds the geometry and runs standalone (`-m`, `-c`) to print the height
 histogram and the detected levels without opening a browser.
 
-Three sliders, all **view-time** filters — nothing is written back to the PLY, so each costs one
+The controls are all **view-time** filters — nothing is written back to the PLY, so each costs one
 masked index rather than a reload:
 
 | control | flag | default | what it does |
 |---|---|---|---|
 | Ceiling cut | `--cut` | detected | drops everything above a height, found from the opacity-weighted height histogram |
-| Near-wall slab | `--wall_frac` | 0.0 (off) | also drops a slab off the one or two walls facing the camera. 0.06–0.12 reads well |
+| Cut near walls | `--no_wall_cut` | on | drops the one or two walls facing the camera, recomputed as you orbit |
+| Wall cut × | `--wall_scale` | 1.0 | multiplier on each wall's *own* detected thickness. 0 disables; 2.0 over-cuts |
 | Room box tightness | `--percentile` | 2.0 | where the robust room box is drawn, which sets both the floater crop and the framing |
+
+`--wall_frac` is retained as a legacy override: one absolute slab thickness, as a fraction of room
+height, applied to all four walls and bypassing detection. It is also the escape hatch for a scene
+where detection declines — an open-plan or outdoor capture, where there are no walls to find.
 
 The projection is really orthographic (gsplat `camera_model="ortho"`), not a long-lens perspective
 fake. `--sh_degree 0` is worth trying: an isometric camera sits far outside the distribution of
 viewing directions the model was supervised on, so the higher SH bands extrapolate into colour
 artefacts.
 
-> ⚠ **Check `prominence` before trusting the cut.** It is the ceiling spike's height above the room
-> plateau. sceneC scores 1.00; sceneA scores **0.09** and is reported `[LOW CONFIDENCE]`, because it
-> has no distinct ceiling plane to find. The fallback there is a cut at 90% of the height range,
-> which is a framing convenience and **not** a detection.
+> ⚠ **Check `prominence` before trusting the cut.** It is the spike's height above the room plateau,
+> reported for the ceiling and for each of the four walls. sceneC's ceiling scores 1.28 and its walls
+> 3.25–11.50; sceneA's ceiling scores **0.09** and is reported `[LOW CONFIDENCE]`, because it has no
+> distinct ceiling plane to find. The ceiling fallback there is a cut at 90% of the height range,
+> which is a framing convenience and **not** a detection — and since a scene with no ceiling is not
+> an enclosed room, all four of its walls are declined too and left standing.
 
 The derivation, the measurements behind every default, and the defects found while building it —
-including why backface culling is unavailable on stage 1c's isotropic Gaussians (though it would
-work on a stage-5 export) and why a generic 3DGS viewer reads this repo's spherical harmonics in
-the wrong order — are in [`dollhouse.md`](dollhouse.md).
+including why backface culling is unavailable on stage 1c's isotropic Gaussians (twice over: the
+splats carry no orientation, and estimated normals reach only 41% recall on walls), why the wall
+search has to run over the room box rather than a percentile range, and why a generic 3DGS viewer
+reads this repo's spherical harmonics in the wrong order — are in [`dollhouse.md`](dollhouse.md).
 
 ---
 
@@ -566,6 +607,7 @@ Use `--stages sfm,1` rather than `--stages 1` for raw photos — `1` alone skips
 | `--wm_loss_weight` | 0.0 | weight for inpainted watermark pixels in 1b/2a/2b; needs stage `wmi` |
 | `--loo_iterations` | 10000 | stages 2a/2b; iterations per leave-one-out model. Use this, not `--iterations` |
 | `--force_loo` | off | stage 2a; delete an existing leave-one-out directory instead of refusing |
+| `--orbit_min_clearance` | -1 | minimum orbit distance from geometry. -1 = auto (match the closest real photo), 0 = off, >0 = world units |
 | `--gsfix_root` | `…/projects/GSFix3D` | stage 1c only; path to the GSFix3D checkout |
 | `--gsfix_ckpt` | `models/gsfixer-base` | stage 1c only; must be the 8-channel *base* variant |
 | `--no_gsfix_finetune` | off | stage 1c only; skip scene fine-tuning and run GSFixer zero-shot |
@@ -573,7 +615,9 @@ Use `--stages sfm,1` rather than `--stages 1` for raw photos — `1` alone skips
 | `--gsfix_pairs_window` | 240 | stage 1c only; leave-one-out iterations kept as fine-tuning pairs |
 | `--gsfix_anchor_every` | 1 | stage 1c only; sparse-photograph steps interleaved into the lift |
 | `--no_watermark_clean` | off | `gsfix_export.py` only; keep the watermark in the fine-tune targets |
-| `--wall_frac` | 0.0 | `view_gs_web.py` only; near-wall slab, as a fraction of room height |
+| `--wall_scale` | 1.0 | `view_gs_web.py` only; multiplier on each wall's own detected thickness |
+| `--no_wall_cut` | off | `view_gs_web.py` only; keep the near walls, cut only the ceiling |
+| `--wall_frac` | 0.0 | `view_gs_web.py` only; legacy absolute slab for all four walls |
 | `--percentile` | 2.0 | `view_gs_web.py` only; where the robust room box is drawn |
 | `--wandb` | off | log per-stage scalar metrics to one Weights & Biases run (see below) |
 | `--wandb_project` | `ri3d` | wandb project; `--wandb_entity`, `--wandb_run_name` also available |
