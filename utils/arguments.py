@@ -115,7 +115,52 @@ class OptimizationParams(ParamGroup):
         self.end_sample_pseudo = 1000000 # not use
         self.sample_pseudo_interval = 10 # not use
         self.random_background = False
+
+        # Which Gaussian backbone the densifying training loops run.
+        #   "3dgs"   gsplat rasterization + vanilla clone/split on a gradient
+        #            threshold. The default, and the only one that needs no
+        #            CUDA build.
+        #   "fastgs" FastGS (CVPR 2026): its own rasterizer plus multi-view
+        #            consistent densification. Requires `uv sync --extra fastgs`;
+        #            see docs/fastgs.md.
+        # Validate with resolve_gs_backbone() -- ParamGroup infers `type` from the
+        # default and has no way to express argparse `choices`, so a typo would
+        # otherwise sail through and silently select the default.
+        self.gs_backbone = "3dgs"
+
+        # FastGS knobs. Inert under "3dgs". Defaults are upstream's except where
+        # noted; upstream tunes for 100+ view captures at 30k iterations, and this
+        # pipeline runs 3 views at 10k, so expect to retune.
+        self.fastgs_loss_thresh = 0.1          # normalized L1 above which a pixel is "high error"
+        self.fastgs_grad_thresh = 0.0002       # clone candidates, normal screen-space gradient
+        self.fastgs_grad_abs_thresh = 0.0012   # split candidates, Abs-GS gradient
+        self.fastgs_dense = 0.001              # scale/extent partition between clone and split
+        self.fastgs_mult = 0.5                 # compact-box multiplier (tiles touched per splat)
+        self.fastgs_score_cams = 10            # cameras sampled per scoring pass, clamped to the stack
+        self.fastgs_importance_thresh = 5.0    # flagged-pixel count a Gaussian needs to densify
+        self.fastgs_highfeature_lr = 0.005     # f_rest; divided by 20 the way feature_lr is
+        self.fastgs_lowfeature_lr = 0.0025     # f_dc
         super().__init__(parser, "Optimization Parameters")
+
+GS_BACKBONES = ("3dgs", "fastgs")
+
+
+def resolve_gs_backbone(opt):
+    """Validate and return `opt.gs_backbone`.
+
+    ParamGroup builds its arguments from attribute types alone, so `--gs_backbone`
+    accepts any string. Without this an unrecognised value -- a typo, or the
+    upstream spelling "fast_gs" -- would run the default backbone under a name
+    that says otherwise, which is the kind of thing you only notice after a full
+    A/B has produced two identical numbers.
+    """
+    backbone = getattr(opt, "gs_backbone", "3dgs")
+    if backbone not in GS_BACKBONES:
+        raise ValueError(
+            f"Unknown --gs_backbone {backbone!r}; expected one of {', '.join(GS_BACKBONES)}."
+        )
+    return backbone
+
 
 LOO_DENSIFY_FRACTION = 0.6
 

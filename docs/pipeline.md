@@ -216,6 +216,10 @@ elsewhere.
 Note `OptimizationParams.iterations` is **10_000** in this repo (`utils/arguments.py`), lowered from
 upstream 3DGS's 30_000.
 
+`--gs_backbone fastgs` swaps the rasterizer and the densification strategy for
+[FastGS](https://github.com/fastgs/FastGS)'s. Off by default and needs a CUDA build — see
+[`fastgs.md`](fastgs.md).
+
 ### Stage `1c` · GSFix3D repair (opt-in)
 
 Takes the stage-1b model and repairs it with **GSFixer**, a Marigold/SD2 latent diffusion model
@@ -605,6 +609,7 @@ Use `--stages sfm,1` rather than `--stages 1` for raw photos — `1` alone skips
 | `--ggpt_python` | `…/envs/ggpt/bin/python` | GGPT only; interpreter for the out-of-process worker |
 | `--prompt` | `xxy5syt00` | rare token for the Repair LoRA; must match across stages 3 and 5 |
 | `--wm_loss_weight` | 0.0 | weight for inpainted watermark pixels in 1b/2a/2b; needs stage `wmi` |
+| `--gs_backbone` | `3dgs` | Gaussian backbone for stages 1b/2a/2b. `fastgs` needs `uv sync --extra fastgs`; see [`fastgs.md`](fastgs.md) |
 | `--loo_iterations` | 10000 | stages 2a/2b; iterations per leave-one-out model. Use this, not `--iterations` |
 | `--force_loo` | off | stage 2a; delete an existing leave-one-out directory instead of refusing |
 | `--orbit_min_clearance` | -1 | minimum orbit distance from geometry. -1 = auto (match the closest real photo), 0 = off, >0 = world units |

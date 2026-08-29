@@ -3,7 +3,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import uuid
 from argparse import ArgumentParser, Namespace
-from utils.arguments import ModelParams, PipelineParams, OptimizationParams, apply_loo_iterations
+from utils.arguments import (ModelParams, PipelineParams, OptimizationParams,
+                             apply_loo_iterations, resolve_gs_backbone)
 from random import randint
 import json
 
@@ -19,7 +20,7 @@ from utils.general_utils import safe_state
 from utils.loss_utils import l1_loss, ssim, monodisp, masked_l1_loss, masked_ssim
 from utils.image_utils import psnr
 from utils import wandb_utils as wb
-from gaussian_renderer import render
+from gaussian_renderer import get_render_fn
 from scene import Scene, GaussianModel
 
 # try:
@@ -30,6 +31,11 @@ from scene import Scene, GaussianModel
 
 def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, train_id):
     first_iter = 0
+    backbone = resolve_gs_backbone(opt)
+    render_fn = get_render_fn(opt)
+    if backbone == "fastgs":
+        # Deferred: reaches the CUDA extension the default backbone omits.
+        from utils.fastgs_utils import sampling_cameras, compute_gaussian_score
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, args.sparse_view_num, spherical_gaussians=True)
     scene = Scene(dataset, gaussians, shuffle=False, extra_opts=args) # make sure no shuffle
@@ -65,6 +71,17 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
     white_bg = torch.ones_like(background).cuda()
     black_bg = torch.zeros_like(background).cuda()
 
+    def score_cameras(iteration):
+        """Cameras the FastGS score may look at, mirroring the training stack.
+
+        Before densify_until_iter the held-out view is excluded -- it is the
+        product of this stage and must not steer densification -- and rejoins
+        afterwards, exactly as the viewpoint stack above does."""
+        cams = scene.getTrainCameras()
+        if iteration > opt.densify_until_iter:
+            return list(cams)
+        return list(cams[:num_id]) + list(cams[num_id + 1:])
+
     for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record() # type: ignore
@@ -94,7 +111,7 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
         # bg = white_bg if randint(0, 1) else black_bg
         bg = white_bg
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        render_pkg = render_fn(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
@@ -124,7 +141,7 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
                         **{f"{pfx}/{k}": v for k, v in terms.items()}})
 
             # Log
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render_fn, (pipe, background))
 
             # Save
             if (iteration in saving_iterations):
@@ -139,8 +156,18 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.01, scene.cameras_extent, size_threshold)
-                
+                    if backbone == "fastgs":
+                        # Scored on the leave-one-out set, not on every training
+                        # camera: the held-out view is the product of this stage
+                        # and must not steer densification.
+                        camlist = sampling_cameras(score_cameras(iteration), opt.fastgs_score_cams)
+                        importance_score, pruning_score = compute_gaussian_score(
+                            camlist, gaussians, pipe, bg, opt, densify=True)
+                        gaussians.densify_and_prune_fastgs(0.01, scene.cameras_extent, size_threshold,
+                                                           opt, importance_score, pruning_score)
+                    else:
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.01, scene.cameras_extent, size_threshold)
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity(val=0.01)
 
@@ -148,10 +175,20 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
                 # if iteration % opt.remove_outliers_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                 #     gaussians.remove_outliers(opt, iteration, linear=True)
 
+            # FastGS's late-stage prune, as fractions of the run rather than
+            # upstream's hardcoded 15k/30k (see train_gs.py for the reasoning).
+            if backbone == "fastgs":
+                prune_from, prune_every = int(0.5 * opt.iterations), max(1, int(0.1 * opt.iterations))
+                if iteration > prune_from and iteration < opt.iterations and iteration % prune_every == 0:
+                    # Same camera set the loop is training on at this point: the
+                    # held-out view rejoins after densify_until_iter.
+                    camlist = sampling_cameras(score_cameras(iteration), opt.fastgs_score_cams)
+                    _, pruning_score = compute_gaussian_score(camlist, gaussians, pipe, bg, opt)
+                    gaussians.final_prune_fastgs(0.1, pruning_score)
+
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer_step(iteration)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -163,7 +200,7 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
                 # bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
                 # bg_color = [1, 0, 1]
                 background = torch.tensor(bg, dtype=torch.float32, device="cuda")
-                rendering = render(infer_cam, gaussians, pipe, background)["render"]
+                rendering = render_fn(infer_cam, gaussians, pipe, background)["render"]
                 gt = infer_cam.original_image[0:3, :, :]
                 render_path = os.path.join(args.model_path, 'left_image')
                 os.makedirs(render_path, exist_ok=True)

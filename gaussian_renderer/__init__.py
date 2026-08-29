@@ -11,10 +11,28 @@
 
 import torch
 import math
+from functools import partial
 from gsplat import rasterization
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.graphics_utils import fov2focal
+
+
+def get_render_fn(opt):
+    """Return the render callable for the backbone `opt` selects.
+
+    The result is a drop-in `render(cam, pc, pipe, bg)`, so call sites do not
+    need to know which backbone they got. The FastGS import is deferred rather
+    than module-level: it pulls in a CUDA extension that only `uv sync --extra
+    fastgs` installs, and the default backbone must keep working without it.
+    """
+    from utils.arguments import resolve_gs_backbone
+
+    if resolve_gs_backbone(opt) == "fastgs":
+        from gaussian_renderer.fastgs import render_fastgs
+        return partial(render_fastgs, mult=opt.fastgs_mult)
+    return render
+
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, fixed_pc : GaussianModel = None, clean_indices : torch.Tensor = None, test=False):
     """

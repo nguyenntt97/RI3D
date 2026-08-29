@@ -716,6 +716,13 @@ def parse_args():
     parser.add_argument("--ggpt_refine", action="store_true",
                         help="Additionally run GGPT's PTv3 point transformer over the fused pointmap "
                              "(needs GGPT/ckpts/model.step228000.pth and the ptv3 extras).")
+    parser.add_argument("--gs_backbone", type=str, default="3dgs", choices=["3dgs", "fastgs"],
+                        help="Gaussian backbone for the densifying stages (1b, 2a, and 2b, which "
+                             "resumes 2a's checkpoint). '3dgs' rasterizes with gsplat and densifies "
+                             "on a single gradient threshold. 'fastgs' uses FastGS's rasterizer and "
+                             "its multi-view consistent densification; it needs a CUDA build "
+                             "(uv sync --extra fastgs) -- see docs/fastgs.md. Stages 1a, 1c and 5 "
+                             "are unaffected.")
     parser.add_argument("--loo_iterations", type=int, default=None,
                         help="Iterations per leave-one-out model (stages 2a/2b). Default 10_000. "
                              "This stage trains one full model per sparse view and is the longest "
@@ -1084,7 +1091,8 @@ def main():
             f"--white_background --random_background "
             f"--ply_path {init_ply} "
             f"--wm_loss_weight {args.wm_loss_weight} "
-            f"--orbit_min_clearance {args.orbit_min_clearance}"
+            f"--orbit_min_clearance {args.orbit_min_clearance} "
+            f"--gs_backbone {args.gs_backbone}"
         )
         run_command(cmd, dry_run=args.dry_run, stage="1b")
         log_success(f"Base 3DGS model saved to {output_gs_init_dir}")
@@ -1117,7 +1125,8 @@ def main():
             f"--white_background --random_background "
             f"--ply_path {init_ply} "
             f"--wm_loss_weight {args.wm_loss_weight} "
-            f"--orbit_min_clearance {args.orbit_min_clearance}"
+            f"--orbit_min_clearance {args.orbit_min_clearance} "
+            f"--gs_backbone {args.gs_backbone}"
             + (f" --loo_iterations {args.loo_iterations}" if args.loo_iterations else "")
         )
         run_command(cmd, dry_run=args.dry_run, stage="2a")
@@ -1133,7 +1142,8 @@ def main():
             f"--white_background --random_background "
             f"--ply_path {init_ply} "
             f"--wm_loss_weight {args.wm_loss_weight} "
-            f"--orbit_min_clearance {args.orbit_min_clearance}"
+            f"--orbit_min_clearance {args.orbit_min_clearance} "
+            f"--gs_backbone {args.gs_backbone}"
             + (f" --loo_iterations {args.loo_iterations}" if args.loo_iterations else "")
         )
         run_command(cmd, dry_run=args.dry_run, stage="2b")

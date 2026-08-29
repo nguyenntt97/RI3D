@@ -59,6 +59,13 @@ logging = ["wandb>=0.19"]
 # are both used and predate it, but 0.x moved the gui/scene namespaces around.
 viewer = ["viser>=1.0", "nerfview>=0.1", "matplotlib"]
 
+# `--gs_backbone fastgs`. Optional because it is the only dependency in the tree
+# that compiles CUDA at install time, and the default backbone does not need it:
+# gsplat ships wheels and rasterizes every stage under `--gs_backbone 3dgs`.
+# Install with `uv sync --extra fastgs`; see docs/fastgs.md for the toolchain
+# prerequisites, which are stricter than the rest of the project's.
+fastgs = ["diff-gaussian-rasterization-fastgs"]
+
 [project.urls]
 Homepage = "https://people.engr.tamu.edu/nimak/Papers/RI3D/index.html"
 Repository = "https://github.com/avinashpaliwal/RI3D"
@@ -74,6 +81,7 @@ torch = { index = "pytorch-cu121" }
 torchvision = { index = "pytorch-cu121" }
 minlora = { path = "third_party/minLoRA" }
 clip = { path = "third_party/CLIP" }
+diff-gaussian-rasterization-fastgs = { path = "third_party/diff-gaussian-rasterization_fastgs" }
 
 [tool.setuptools.packages.find]
 include = [

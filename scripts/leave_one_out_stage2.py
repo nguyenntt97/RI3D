@@ -3,7 +3,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import uuid
 from argparse import ArgumentParser, Namespace
-from utils.arguments import ModelParams, PipelineParams, OptimizationParams, apply_loo_iterations
+from utils.arguments import (ModelParams, PipelineParams, OptimizationParams,
+                             apply_loo_iterations, resolve_gs_backbone)
 from random import randint
 import json
 
@@ -19,7 +20,7 @@ from utils.general_utils import safe_state
 from utils.loss_utils import l1_loss, ssim, monodisp, masked_l1_loss, masked_ssim
 from utils.image_utils import psnr
 from utils import wandb_utils as wb
-from gaussian_renderer import render
+from gaussian_renderer import get_render_fn
 from scene import Scene, GaussianModel
 
 try:
@@ -30,6 +31,10 @@ except ImportError:
 
 def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, train_id):
     first_iter = 6000 # in this code, we just use the data from 6000 iter
+    # 2b does not densify, but it resumes 2a's checkpoint, whose optimizer layout
+    # is a property of the backbone that wrote it -- so the backbone has to match.
+    resolve_gs_backbone(opt)
+    render_fn = get_render_fn(opt)
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, args.sparse_view_num, spherical_gaussians=True)
     scene = Scene(dataset, gaussians, shuffle=False, extra_opts=args) # make sure we load "densify_until_iter" model
@@ -90,7 +95,7 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
         # bg = torch.rand((3), device="cuda") if opt.random_background else background
         bg = white_bg #if randint(0, 1) else black_bg
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        render_pkg = render_fn(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
@@ -120,7 +125,7 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
                         **{f"{pfx}/{k}": v for k, v in terms.items()}})
 
             # Log
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render_fn, (pipe, background))
 
             # Save
             if (iteration in saving_iterations):
@@ -146,8 +151,7 @@ def leave_one_out_training(args, dataset, opt, pipe, testing_iterations, saving_
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer_step(iteration)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

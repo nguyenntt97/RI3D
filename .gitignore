@@ -60,6 +60,7 @@ models/*
 !models/.gitkeep
 !models/README.md
 pretrained/
+third_party/
 *.ckpt
 *.pth
 *.safetensors

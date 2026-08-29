@@ -21,8 +21,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from torchmetrics.functional.regression import pearson_corrcoef
-from utils.arguments import ModelParams, OptimizationParams, PipelineParams
-from gaussian_renderer import network_gui, render
+from utils.arguments import ModelParams, OptimizationParams, PipelineParams, resolve_gs_backbone
+from gaussian_renderer import network_gui, get_render_fn
 from scene import GaussianModel, Scene
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
@@ -33,6 +33,13 @@ from utils import wandb_utils as wb
 
 def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
+    backbone = resolve_gs_backbone(opt)
+    render_fn = get_render_fn(opt)
+    print(f"[gs_backbone] {backbone}")
+    if backbone == "fastgs":
+        # Deferred for the same reason as the renderer: this reaches the CUDA
+        # extension, which the default backbone does not install.
+        from utils.fastgs_utils import sampling_cameras, compute_gaussian_score
     tb_writer = prepare_output_and_logger(dataset)
     wb.attach()
     wb.define_axis("stage_1b", "iter")
@@ -72,7 +79,7 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    net_image = render_fn(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -103,7 +110,7 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
         bg = torch.rand((3), device="cuda") if opt.random_background else background
         # bg = white_bg if randint(0, 1) else black_bg
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        render_pkg = render_fn(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], \
             render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -152,7 +159,7 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
                         **{f"stage_1b/{k}": v for k, v in terms.items()}})
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render_fn, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -165,18 +172,34 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
+                    if backbone == "fastgs":
+                        camlist = sampling_cameras(scene.getTrainCameras(), opt.fastgs_score_cams)
+                        importance_score, pruning_score = compute_gaussian_score(
+                            camlist, gaussians, pipe, bg, opt, densify=True)
+                        gaussians.densify_and_prune_fastgs(0.005, scene.cameras_extent, size_threshold,
+                                                           opt, importance_score, pruning_score)
+                    else:
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
                 # if iteration % opt.remove_outliers_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                 #     gaussians.remove_outliers(opt, iteration, linear=True)
 
+            # FastGS's late-stage prune. Upstream fires it every 3k iterations
+            # between 15k and 30k; expressed as fractions so it still runs on
+            # this pipeline's 10k default instead of being dead code.
+            if backbone == "fastgs":
+                prune_from, prune_every = int(0.5 * opt.iterations), max(1, int(0.1 * opt.iterations))
+                if iteration > prune_from and iteration < opt.iterations and iteration % prune_every == 0:
+                    camlist = sampling_cameras(scene.getTrainCameras(), opt.fastgs_score_cams)
+                    _, pruning_score = compute_gaussian_score(camlist, gaussians, pipe, bg, opt)
+                    gaussians.final_prune_fastgs(0.1, pruning_score)
+
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer_step(iteration)
 
 
                 # gaussians.monoso_optimizer.step()

@@ -53,6 +53,10 @@ python scripts/download_hf_models.py
 python mast3r/download_mast3r_models.py
 ```
 
+Optional extras: `uv sync --extra logging` (Weights & Biases), `--extra viewer` (the web viewer),
+`--extra fastgs` (the [FastGS](docs/fastgs.md) backbone — compiles CUDA, so read
+[`docs/fastgs.md`](docs/fastgs.md) for the toolchain prerequisites first).
+
 ---
 
 ## Quick Start

@@ -59,8 +59,16 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        # FastGS splits the densification criterion in two: the plain
+        # screen-space gradient decides clones, the Abs-GS gradient decides
+        # splits. Unused under the 3dgs backbone, which has a single threshold.
+        self.xyz_gradient_accum_abs = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        # Second Adam holding f_rest, stepped on its own stride. Only built under
+        # the fastgs backbone; None means every parameter lives in self.optimizer.
+        self.shoptimizer = None
+        self.gs_backbone = "3dgs"
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self._backup_attributes = {}
@@ -95,6 +103,8 @@ class GaussianModel:
         self.enable_learned_opac = enable_learned_opac
 
     def capture(self):
+        # The trailing three entries postdate --gs_backbone; restore() unpacks by
+        # length so checkpoints written before it still load.
         return (
             self.active_sh_degree,
             self._xyz,
@@ -108,25 +118,49 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.gs_backbone,
+            self.shoptimizer.state_dict() if self.shoptimizer is not None else None,
+            self.xyz_gradient_accum_abs,
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        opt_dict,
+        self.spatial_lr_scale) = model_args[:12]
+
+        saved_backbone, sh_opt_dict, xyz_gradient_accum_abs = "3dgs", None, None
+        if len(model_args) > 12:
+            saved_backbone, sh_opt_dict, xyz_gradient_accum_abs = model_args[12:15]
+
+        # The optimizer layout is a property of the backbone that wrote the
+        # checkpoint, not of the flag on this run: fastgs holds f_rest in a
+        # second Adam, so loading its state into a single-optimizer model (or
+        # vice versa) silently mismatches the parameter groups.
+        requested = getattr(training_args, "gs_backbone", "3dgs")
+        if requested != saved_backbone:
+            raise ValueError(
+                f"Checkpoint was written by --gs_backbone {saved_backbone!r} but this run "
+                f"requested {requested!r}. Re-run the earlier stage under {requested!r}, or "
+                f"resume with --gs_backbone {saved_backbone!r}."
+            )
+
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
+        if xyz_gradient_accum_abs is not None:
+            self.xyz_gradient_accum_abs = xyz_gradient_accum_abs
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        if self.shoptimizer is not None and sh_opt_dict is not None:
+            self.shoptimizer.load_state_dict(sh_opt_dict)
 
     @property
     def cache(self):
@@ -305,6 +339,16 @@ class GaussianModel:
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
+
+    # The FastGS rasterizer takes the DC term and the higher-order bands as two
+    # separate arguments rather than the concatenated block gsplat wants.
+    @property
+    def get_features_dc(self):
+        return self._features_dc
+
+    @property
+    def get_features_rest(self):
+        return self._features_rest
     
     @property
     def get_opacity(self):
@@ -392,41 +436,115 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.gs_backbone = getattr(training_args, "gs_backbone", "3dgs")
         self.xyz_gradient_accum = torch.zeros((self._features_dc.shape[0], 1), device=self.device)
+        self.xyz_gradient_accum_abs = torch.zeros((self._features_dc.shape[0], 1), device=self.device)
         self.denom = torch.zeros((self._features_dc.shape[0], 1), device=self.device)
 
-        l = [
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+        fastgs = self.gs_backbone == "fastgs"
+        dc_lr = getattr(training_args, "fastgs_lowfeature_lr", 0.0025) if fastgs else training_args.feature_lr
+        rest_lr = (getattr(training_args, "fastgs_highfeature_lr", 0.005) if fastgs
+                   else training_args.feature_lr) / 20.0
+
+        sh_l = [{'params': [self._features_rest], 'lr': rest_lr, "name": "f_rest"}]
+        # Group order under 3dgs is load-bearing and must not drift:
+        # Adam.load_state_dict maps state by position, so a reshuffle would
+        # silently mis-assign the moments of every checkpoint written before it.
+        l = [{'params': [self._features_dc], 'lr': dc_lr, "name": "f_dc"}]
+        if not fastgs:
+            l += sh_l
+        l += [
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
         ]
 
         if not self.mono_d_so_enable:
             l.append({'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # Under fastgs f_rest gets its own optimizer so it can be stepped on a
+        # coarser stride -- most of FastGS's per-iteration saving comes from not
+        # touching the high-order SH every step.
+        self.shoptimizer = torch.optim.Adam(sh_l, lr=0.0, eps=1e-15) if fastgs else None
+
+        # FastGS's published stride switches at 15k/20k of a 30k run. This
+        # pipeline's default is 10k, so express them as fractions or the whole
+        # schedule collapses to its first branch.
+        total_iters = getattr(training_args, "iterations", 30_000)
+        self._sh_stride_bounds = (int(0.5 * total_iters), int(2.0 / 3.0 * total_iters))
+
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
+    @property
+    def optimizers(self):
+        """Every optimizer holding a densifiable parameter group.
+
+        One entry under 3dgs, two under fastgs. The prune/append/replace helpers
+        iterate this so they stay correct for both.
+        """
+        opts = [self.optimizer] if self.optimizer is not None else []
+        if self.shoptimizer is not None:
+            opts.append(self.shoptimizer)
+        return opts
+
+    def optimizer_step(self, iteration):
+        """Take one optimization step under whichever backbone is active.
+
+        Under 3dgs this is the plain `step(); zero_grad()` the training loops
+        used to inline. Under fastgs the high-order SH is stepped every 16
+        iterations, and past the halfway/two-thirds marks the whole update is
+        strided down to 1/32 and 1/64.
+        """
+        if self.shoptimizer is None:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            return
+
+        half, two_thirds = self._sh_stride_bounds
+        if iteration <= half:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            if iteration % 16 == 0:
+                self.shoptimizer.step()
+                self.shoptimizer.zero_grad(set_to_none=True)
+        else:
+            stride = 32 if iteration <= two_thirds else 64
+            if iteration % stride == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.shoptimizer.step()
+                self.shoptimizer.zero_grad(set_to_none=True)
+
 
     def reset_learning_rates(self, training_args):
 
-        l = [
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+        fastgs = self.gs_backbone == "fastgs"
+        dc_lr = getattr(training_args, "fastgs_lowfeature_lr", 0.0025) if fastgs else training_args.feature_lr
+        rest_lr = (getattr(training_args, "fastgs_highfeature_lr", 0.005) if fastgs
+                   else training_args.feature_lr) / 20.0
+
+        sh_l = [{'params': [self._features_rest], 'lr': rest_lr, "name": "f_rest"}]
+        l = [{'params': [self._features_dc], 'lr': dc_lr, "name": "f_dc"}]
+        if not fastgs:
+            l += sh_l
+        l += [
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': 0, "name": "scaling"},
-            {'params': [self._rotation], 'lr': 0, "name": "rotation"}
+            {'params': [self._rotation], 'lr': 0, "name": "rotation"},
         ]
 
         if not self.mono_d_so_enable:
             l.append({'params': [self._xyz], 'lr': 0, "name": "xyz"})
 
+        # Keep the same split as training_setup: rebuilding a single optimizer
+        # here would strand f_rest outside self.optimizers, and the next
+        # densification would then fail to grow it alongside the rest.
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.shoptimizer = torch.optim.Adam(sh_l, lr=0.0, eps=1e-15) if fastgs else None
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -558,35 +676,37 @@ class GaussianModel:
     
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            if group["name"] == name:
-                stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+        for opt in self.optimizers:
+            for group in opt.param_groups:
+                if group["name"] == name:
+                    stored_state = opt.state.get(group['params'][0], None)
+                    stored_state["exp_avg"] = torch.zeros_like(tensor)
+                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
 
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                    del opt.state[group['params'][0]]
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                    opt.state[group['params'][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = group["params"][0]
+                    optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+        for opt in self.optimizers:
+            for group in opt.param_groups:
+                stored_state = opt.state.get(group['params'][0], None)
+                if stored_state is not None:
+                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
-                self.optimizer.state[group['params'][0]] = stored_state
+                    del opt.state[group['params'][0]]
+                    group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                    opt.state[group['params'][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
-                optimizable_tensors[group["name"]] = group["params"][0]
+                    optimizable_tensors[group["name"]] = group["params"][0]
+                else:
+                    group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                    optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
     def prune_points(self, mask):
@@ -601,29 +721,32 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        if self.xyz_gradient_accum_abs.numel():
+            self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            assert len(group["params"]) == 1
-            extension_tensor = tensors_dict[group["name"]]
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
+        for opt in self.optimizers:
+            for group in opt.param_groups:
+                assert len(group["params"]) == 1
+                extension_tensor = tensors_dict[group["name"]]
+                stored_state = opt.state.get(group['params'][0], None)
+                if stored_state is not None:
 
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+                    stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
+                    stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                    del opt.state[group['params'][0]]
+                    group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                    opt.state[group['params'][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
-                optimizable_tensors[group["name"]] = group["params"][0]
+                    optimizable_tensors[group["name"]] = group["params"][0]
+                else:
+                    group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                    optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
 
@@ -644,6 +767,7 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
 
@@ -760,6 +884,125 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
+    # ------------------------------------------------------------------
+    # FastGS densification (--gs_backbone fastgs)
+    #
+    # Ported from FastGS/scene/gaussian_model.py. Two departures from
+    # upstream, both noted at their site: `tmp_radii` is dropped (upstream
+    # threads it through densification_postfix and then discards it without
+    # ever consulting it), and every tensor stays on self.device (upstream
+    # allocates the pruning weights on CPU and then assigns a CUDA slice into
+    # them).
+    # ------------------------------------------------------------------
+
+    def densify_and_clone_fastgs(self, metric_mask, candidates):
+        selected_pts_mask = torch.logical_and(metric_mask, candidates)
+
+        new_xyz = self._xyz[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                                   new_opacities, new_scaling, new_rotation)
+
+    def densify_and_split_fastgs(self, metric_mask, candidates, N=2):
+        n_init_points = self.get_xyz.shape[0]
+
+        selected_pts_mask = torch.zeros((n_init_points), dtype=bool, device=self.device)
+        mask = torch.logical_and(metric_mask, candidates)
+        selected_pts_mask[:mask.shape[0]] = mask
+
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device=self.device)
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask], device=self.device).repeat(N, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                                   new_opacity, new_scaling, new_rotation)
+
+        prune_filter = torch.cat((selected_pts_mask,
+                                  torch.zeros(N * selected_pts_mask.sum(), device=self.device, dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def densify_and_prune_fastgs(self, min_opacity, extent, max_screen_size, opt,
+                                 importance_score, pruning_score):
+        """FastGS densify-and-prune.
+
+        Candidates are picked by two gradient thresholds -- the plain gradient
+        for clones, the Abs-GS gradient for splits, partitioned by whether the
+        splat is smaller or larger than `fastgs_dense * extent` -- and then
+        filtered by the multi-view consistency score, so only Gaussians that
+        several views agree are reconstructing badly actually grow.
+
+        Pruning is budgeted: of the Gaussians eligible on opacity/size, half are
+        sampled for removal with probability inversely proportional to their
+        consistency score.
+        """
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+        grads_abs = self.xyz_gradient_accum_abs / self.denom
+        grads_abs[grads_abs.isnan()] = 0.0
+
+        grad_qualifiers = torch.norm(grads, dim=-1) >= opt.fastgs_grad_thresh
+        grad_qualifiers_abs = torch.norm(grads_abs, dim=-1) >= opt.fastgs_grad_abs_thresh
+        max_scaling = torch.max(self.get_scaling, dim=1).values
+        all_clones = torch.logical_and(max_scaling <= opt.fastgs_dense * extent, grad_qualifiers)
+        all_splits = torch.logical_and(max_scaling > opt.fastgs_dense * extent, grad_qualifiers_abs)
+
+        metric_mask = importance_score > opt.fastgs_importance_thresh
+
+        self.densify_and_clone_fastgs(metric_mask, all_clones)
+        self.densify_and_split_fastgs(metric_mask, all_splits)
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        scores = 1 - pruning_score
+        remove_budget = int(0.5 * torch.sum(prune_mask).item())
+        if remove_budget:
+            n_init_points = self.get_xyz.shape[0]
+            weights = torch.zeros((n_init_points), dtype=torch.float32, device=self.device)
+            weights[:scores.shape[0]] = 1 / (1e-6 + scores.squeeze())
+            # multinomial without replacement cannot draw more than the number of
+            # non-zero weights; the budget is derived from a different mask, so
+            # nothing guarantees it fits.
+            remove_budget = min(remove_budget, int((weights > 0).sum().item()))
+            if remove_budget:
+                selected_pts_mask = torch.zeros_like(weights, dtype=bool, device=self.device)
+                selected_pts_mask[torch.multinomial(weights, remove_budget, replacement=False)] = True
+                self.prune_points(torch.logical_and(prune_mask, selected_pts_mask))
+
+        # FastGS caps opacity here instead of resetting it to a floor, so
+        # over-confident splats decay back into contention gradually.
+        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.8))
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+
+        torch.cuda.empty_cache()
+
+    def final_prune_fastgs(self, min_opacity, pruning_score):
+        """Late-stage prune on opacity plus multi-view consistency.
+
+        Runs after the model has essentially converged, where FastGS can afford
+        to be aggressive without costing quality.
+        """
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        scores_mask = pruning_score > 0.9
+        self.prune_points(torch.logical_or(prune_mask, scores_mask))
+        torch.cuda.empty_cache()
+
     def densify(self, max_grad, extent):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -822,14 +1065,30 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        # gsplat stores absolute gradients in .absgrad [C, N, 2] after backward
-        grad = getattr(viewspace_point_tensor, 'absgrad', None)
-        if grad is None:
-            grad = viewspace_point_tensor.grad
-        if grad is not None:
-            if grad.dim() == 3:
-                grad = grad[0]  # [C, N, 2] -> [N, 2]
-            self.xyz_gradient_accum[update_filter] += torch.norm(grad[update_filter,:2], dim=-1, keepdim=True)
+        # Two shapes arrive here depending on the backbone:
+        #
+        #   fastgs  a [N, 4] screen-space tensor whose .grad packs the plain
+        #           gradient into columns 0:2 and the Abs-GS gradient into 2:4.
+        #           Both accumulators get filled; densify_and_prune_fastgs
+        #           thresholds clones on the first and splits on the second.
+        #   3dgs    gsplat's means2d, which carries .absgrad [C, N, 2] and no
+        #           .grad at all (gsplat only calls retain_grad() from its own
+        #           DefaultStrategy, which this repo does not use). One
+        #           accumulator, fed from absgrad, exactly as before.
+        packed = viewspace_point_tensor.grad
+        if packed is not None and packed.shape[-1] == 4:
+            if packed.dim() == 3:
+                packed = packed[0]
+            self.xyz_gradient_accum[update_filter] += torch.norm(packed[update_filter, :2], dim=-1, keepdim=True)
+            self.xyz_gradient_accum_abs[update_filter] += torch.norm(packed[update_filter, 2:], dim=-1, keepdim=True)
+        else:
+            grad = getattr(viewspace_point_tensor, 'absgrad', None)
+            if grad is None:
+                grad = viewspace_point_tensor.grad
+            if grad is not None:
+                if grad.dim() == 3:
+                    grad = grad[0]  # [C, N, 2] -> [N, 2]
+                self.xyz_gradient_accum[update_filter] += torch.norm(grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
     def add_densification_stats_no_grad(self, viewspace_point_tensor, update_filter):
